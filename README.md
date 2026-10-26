@@ -151,10 +151,15 @@ a header for each step.
 
 Lists and pull request screens each come from one GraphQL query. Diffs, review comments and Actions come from the
 REST API, asked for again with the last response's ETag. GitHub answers 304 when nothing changed, and a 304 does not
-count against the hourly limit. Lists refresh every 30 seconds (every 10 while an Actions run on screen is moving),
-and a pull request's screen every minute, or every 15 seconds while its checks run. When either hourly budget runs
-low, everything slows to once a minute or two. When a limit is reached, ghdeck stops asking until the reset time it
-shows. `GH_HOST` points it at GitHub Enterprise.
+count against the hourly limit. GraphQL has no such shortcut, so every refresh there is paid for: about 2 points for
+a list, 1 for the header or a pull request's screen, out of 5,000 an hour that `gh` and your agents share.
+
+Lists refresh every 30 seconds (every 10 while an Actions run on screen is moving), the header once a minute, and a
+pull request's screen every minute, or every 15 seconds while its checks run. That is about 300 points an hour while
+you use it. After 10 minutes with no key pressed, everything slows to once every 2 minutes, and after an hour to once
+every 10, so a deck left open in a pane costs about 20 points an hour. The next key refreshes at once. When either
+hourly budget falls below 1,000, everything slows to once every 2 minutes. When a limit is reached, ghdeck stops asking
+until the reset time it shows. `GH_HOST` points it at GitHub Enterprise.
 
 ## Security
 

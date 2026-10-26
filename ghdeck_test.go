@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -186,5 +187,29 @@ func TestCheckRank(t *testing.T) {
 	passed := Check{Status: "COMPLETED", Conclusion: "SUCCESS"}
 	if !(checkRank(failing) < checkRank(running) && checkRank(running) < checkRank(passed)) {
 		t.Error("want failing, then running, then passed")
+	}
+}
+
+// A deck left open in a pane nobody looks at slows right down, and the first key brings it back.
+func TestPaceSlowsWhenIdle(t *testing.T) {
+	defer func(t0 time.Time) { lastActive = t0 }(lastActive)
+	for _, c := range []struct {
+		quiet, every, want time.Duration
+	}{
+		{time.Minute, 30 * time.Second, 30 * time.Second},
+		{15 * time.Minute, 30 * time.Second, idleEvery},
+		{15 * time.Minute, 5 * time.Minute, 5 * time.Minute}, // never faster than asked
+		{2 * time.Hour, 4 * time.Second, asleepEvery},
+	} {
+		lastActive = time.Now().Add(-c.quiet)
+		if got := pace(c.every); got != c.want {
+			t.Errorf("idle %s: pace(%s) = %s, want %s", c.quiet, c.every, got, c.want)
+		}
+	}
+	lastActive = time.Now().Add(-2 * time.Hour)
+	m := newModel(Repo{Slug: "o/r"})
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
+	if idle() || cmd == nil {
+		t.Error("a key should end the idle spell and wake the deck")
 	}
 }

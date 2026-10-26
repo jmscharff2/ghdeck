@@ -24,7 +24,7 @@ import (
 const (
 	ghFresh      = 3 * time.Second  // an answer this new is reused without asking again
 	ghLowFresh   = time.Minute      // the same, while the hourly budget is running low
-	ghLowBudget  = 300              // requests left that count as running low
+	ghLowBudget  = 1000             // left that count as running low: gh and agents share the same budget
 	ghMaxBody    = 16 << 20         // the largest response read
 	ghMaxEntries = 400              // responses kept for revalidation
 	ghTimeout    = 20 * time.Second // one request
@@ -309,6 +309,36 @@ func lowBudget() bool {
 	gh.mu.Lock()
 	defer gh.mu.Unlock()
 	return gh.remaining >= 0 && gh.remaining < ghLowBudget || gh.gqlLeft >= 0 && gh.gqlLeft < ghLowBudget
+}
+
+// Nobody needs a list kept fresh to the second in a pane they stopped looking at, and a deck left open in a few Herdr
+// workspaces all day would otherwise spend the hourly budget that gh and the agents share with it. After a while with
+// no keys pressed, every refresh slows down; the next key refreshes everything and goes back to the usual pace. (Herdr
+// tells panes they have focus when they have not, so focus does not count.) Only the UI goroutine touches lastActive.
+const (
+	idleAfter   = 10 * time.Minute
+	idleEvery   = 2 * time.Minute
+	asleepAfter = time.Hour
+	asleepEvery = 10 * time.Minute
+)
+
+var lastActive = time.Now()
+
+// idle says nobody has used ghdeck for a while.
+func idle() bool { return time.Since(lastActive) > idleAfter }
+
+// pace stretches a refresh interval while ghdeck sits idle or the hourly budget runs low.
+func pace(every time.Duration) time.Duration {
+	switch quiet := time.Since(lastActive); {
+	case quiet > asleepAfter:
+		every = max(every, asleepEvery)
+	case quiet > idleAfter:
+		every = max(every, idleEvery)
+	}
+	if lowBudget() {
+		every = max(every, 2*time.Minute)
+	}
+	return every
 }
 
 // forget drops cached responses under a path prefix, after a write that changes them.

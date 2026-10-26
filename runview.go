@@ -52,7 +52,7 @@ type runDataMsg struct {
 
 func (m runDataMsg) viewID() int { return m.id }
 
-type runTickMsg struct{ id int }
+type runTickMsg struct{ id, gen int }
 
 func (m runTickMsg) viewID() int { return m.id }
 
@@ -78,6 +78,7 @@ type runView struct {
 	flash   string
 	flashOK bool
 	ask     *confirmation // a pending question
+	gen     int           // which fetch's tick is current, so refreshes do not pile up timers
 }
 
 func newRunView(r Repo, runID int64) *runView {
@@ -96,7 +97,8 @@ func runJobDetails(repo string, id int64) ([]jobDetail, error) {
 func (v *runView) ID() int { return v.id }
 func (v *runView) Close()  {}
 
-func (v *runView) Init() tea.Cmd { return v.fetch() }
+func (v *runView) Init() tea.Cmd    { return v.fetch() }
+func (v *runView) Refresh() tea.Cmd { return v.fetch() }
 
 func (v *runView) fetch() tea.Cmd {
 	v.loading = true
@@ -139,20 +141,23 @@ func (v *runView) Update(msg tea.Msg) (bool, tea.Cmd) {
 			}
 		}
 		// Poll while anything is still moving.
+		v.gen++
 		if v.d == nil || v.d.Status != "completed" {
-			id := v.id
-			return true, tea.Tick(4*time.Second, func(time.Time) tea.Msg { return runTickMsg{id} })
+			id, gen := v.id, v.gen
+			return true, tea.Tick(pace(4*time.Second), func(time.Time) tea.Msg { return runTickMsg{id, gen} })
 		}
 	case runTickMsg:
-		return true, v.fetch()
+		if msg.gen == v.gen {
+			return true, v.fetch()
+		}
 	case runActionMsg:
 		if msg.err != nil {
 			v.flash, v.flashOK = errText(msg.err), false
 		} else {
 			v.flash, v.flashOK = msg.text, true
 		}
-		id := v.id
-		return true, tea.Tick(2*time.Second, func(time.Time) tea.Msg { return runTickMsg{id} })
+		id, gen := v.id, v.gen
+		return true, tea.Tick(2*time.Second, func(time.Time) tea.Msg { return runTickMsg{id, gen} })
 	case tea.KeyMsg:
 		return v.key(msg)
 	}
