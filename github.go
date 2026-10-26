@@ -281,16 +281,21 @@ type Detail struct {
 	Events    []Event
 	Linked    []Item // pull requests that will close this issue
 	Methods   []string
+
+	AutoAllowed bool   // the repository lets pull requests merge themselves once they can
+	AutoMerge   string // the method set to merge with once checks and reviews allow, or ""
+	AutoBy      string
 }
 
 const detailQuery = `query($o: String!, $n: String!, $num: Int!) {
 	repository(owner: $o, name: $n) {
-		squashMergeAllowed mergeCommitAllowed rebaseMergeAllowed viewerDefaultMergeMethod
+		squashMergeAllowed mergeCommitAllowed rebaseMergeAllowed viewerDefaultMergeMethod autoMergeAllowed
 		issueOrPullRequest(number: $num) {
 			__typename
 			... on PullRequest {
 				id number title state url body createdAt updatedAt isDraft headRefName baseRefName headRefOid
 				reviewDecision additions deletions changedFiles mergeable mergeStateStatus isCrossRepository
+				autoMergeRequest { mergeMethod enabledBy { login } }
 				author { login }
 				comments { totalCount }
 				labels(first: 20) { nodes { name } }
@@ -410,6 +415,7 @@ func fetchDetail(repo string, number int) (*Detail, error) {
 			Merge   bool   `json:"mergeCommitAllowed"`
 			Rebase  bool   `json:"rebaseMergeAllowed"`
 			Default string `json:"viewerDefaultMergeMethod"`
+			Auto    bool   `json:"autoMergeAllowed"`
 			Node    *struct {
 				gqlItem
 				ID         string    `json:"id"`
@@ -420,6 +426,10 @@ func fetchDetail(repo string, number int) (*Detail, error) {
 				Mergeable  string    `json:"mergeable"`
 				MergeState string    `json:"mergeStateStatus"`
 				CrossRepo  bool      `json:"isCrossRepository"`
+				AutoMerge  *struct {
+					Method string   `json:"mergeMethod"`
+					By     gqlLogin `json:"enabledBy"`
+				} `json:"autoMergeRequest"`
 				ReviewReqs struct {
 					Nodes []struct {
 						Reviewer *struct {
@@ -488,6 +498,7 @@ func fetchDetail(repo string, number int) (*Detail, error) {
 	d := &Detail{
 		Item: n.item(), ID: n.ID, Body: cleanBody(n.Body), Created: n.CreatedAt, HeadSHA: clean(n.HeadOID),
 		Changed: n.Changed, Mergeable: clean(n.Mergeable), MergeWhy: clean(n.MergeState), Fork: n.CrossRepo,
+		AutoAllowed: resp.Repository.Auto,
 	}
 	for _, r := range n.ReviewReqs.Nodes {
 		if r.Reviewer != nil {
@@ -534,6 +545,9 @@ func fetchDetail(repo string, number int) (*Detail, error) {
 		d.Linked = append(d.Linked, Item{Number: c.Number, Title: clean(c.Title), State: clean(c.State), URL: clean(c.URL), IsPR: true})
 	}
 	r := resp.Repository
+	if a := r.Node.AutoMerge; a != nil {
+		d.AutoMerge, d.AutoBy = strings.ToLower(clean(a.Method)), clean(a.By.Login)
+	}
 	def := strings.ToLower(clean(r.Default))
 	for _, m := range []struct {
 		name string
@@ -696,7 +710,19 @@ func mergePR(repo string, number int, sha, method string) error {
 }
 
 func deleteBranch(repo, branch string) error {
-	return ghWrite("DELETE", fmt.Sprintf("repos/%s/git/refs/heads/%s", repo, url.PathEscape(branch)), nil, nil)
+	return ghWrite("DELETE", fmt.Sprintf("repos/%s/git/refs/heads/%s", repo, refPath(branch)), nil, nil)
+}
+
+// setAutoMerge has a pull request merge itself, by method, once its checks and reviews allow, if its head is still
+// sha; or stops it.
+func setAutoMerge(prID, method, sha string, on bool) error {
+	if !on {
+		return ghQuery(`mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }`,
+			map[string]any{"id": prID}, nil)
+	}
+	return ghQuery(`mutation($id: ID!, $m: PullRequestMergeMethod!, $sha: GitObjectID!) {
+		enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: $m, expectedHeadOid: $sha}) { clientMutationId } }`,
+		map[string]any{"id": prID, "m": strings.ToUpper(method), "sha": sha}, nil)
 }
 
 func assign(repo string, number int, who string) error {

@@ -143,7 +143,7 @@ a header for each step.
 | `c` | comment |
 | `d` `s` | the diff, every check (enter on an Actions check opens its run) |
 | `v` | review: comment, approve or request changes, with the diff's drafted line comments |
-| `m` | merge, by any method the repo allows, optionally deleting the branch (type `merge`) |
+| `m` | merge, by any method the repo allows, optionally deleting the branch, or set it to merge itself once checks pass and reviews allow (type `merge`) |
 | `D` | convert to draft, or mark ready for review |
 | `x` | close or reopen (type `yes`) |
 | `A` | assign yourself |

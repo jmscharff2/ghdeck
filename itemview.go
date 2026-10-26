@@ -240,6 +240,33 @@ func (v *itemView) mergePicker() *picker {
 	d, repo := v.d, v.repo.Slug
 	var opts []option
 	verbs := map[string]string{"squash": "Squash and merge", "merge": "Create a merge commit", "rebase": "Rebase and merge"}
+	// Auto-merge: GitHub merges it once checks pass and reviews allow, so nobody has to wait to press the button.
+	if d.AutoMerge != "" {
+		opts = append(opts, option{label: "Stop merging it automatically", detail: "set by " + d.AutoBy + " to " + d.AutoMerge,
+			run: func() tea.Cmd {
+				return func() tea.Msg {
+					if err := setAutoMerge(d.ID, "", "", false); err != nil {
+						return actionMsg{err: err}
+					}
+					return actionMsg{text: fmt.Sprintf("#%d will not merge itself", d.Number), refresh: true}
+				}
+			}})
+	} else if d.AutoAllowed && d.MergeWhy != "CLEAN" && d.MergeWhy != "HAS_HOOKS" && !d.Draft {
+		for _, method := range d.Methods {
+			method := method
+			opts = append(opts, option{label: verbs[method] + ", once it can", detail: "when checks pass and reviews allow; nothing to wait for",
+				run: func() tea.Cmd {
+					v.ask = newConfirmation(fmt.Sprintf("%s #%d into %s once it can?", verbs[method], d.Number, d.Base), func() tea.Msg {
+						if err := setAutoMerge(d.ID, method, d.HeadSHA, true); err != nil {
+							return actionMsg{err: err}
+						}
+						return actionMsg{text: fmt.Sprintf("#%d merges itself once it can", d.Number), refresh: true}
+					})
+					v.ask.require = "merge"
+					return nil
+				}})
+		}
+	}
 	for _, method := range d.Methods {
 		for _, del := range []bool{false, true} {
 			if del && d.Fork {
@@ -413,6 +440,9 @@ func checksSummary(checks []Check) string {
 
 // mergeLine says whether the pull request can merge, and if not, why.
 func mergeLine(d *Detail) string {
+	if d.AutoMerge != "" {
+		return sGood.Render(fmt.Sprintf("merges itself (%s) once it can", d.AutoMerge)) + sMuted.Render(", set by "+d.AutoBy)
+	}
 	switch {
 	case d.Mergeable == "CONFLICTING" || d.MergeWhy == "DIRTY":
 		return sBad.Render("conflicts with " + d.Base)
