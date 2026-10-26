@@ -67,5 +67,7 @@ command = ["sh", "-c", "exec \"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plu
 [[link_handlers]]
 id = "github"
 title = "Open in ghdeck"
-pattern = "^https://github\\.com/[^/]+/[^/]+/(pull/[0-9]+(/files)?|issues/[0-9]+|actions/runs/[0-9]+)([/?#].*)?$"
+# Any host, for GitHub Enterprise: ghdeck opens links on $GH_HOST (github.com by default) and hands the rest to the
+# browser, as the click would have done.
+pattern = "^https://[^/]+/[^/]+/[^/]+/(pull/[0-9]+(/files)?|issues/[0-9]+|actions/runs/[0-9]+)([/?#].*)?$"
 action = "open-link"

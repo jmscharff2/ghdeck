@@ -72,7 +72,8 @@ command = "ghdeck.open"
 Inside Herdr, ghdeck also:
 
 - **opens GitHub links you ctrl+click** in any pane, an agent's output say: a pull request, its files, an issue, or an
-  Actions run opens in ghdeck over that pane, and `q` puts you back. (Herdr routes clicks to plugins while
+  Actions run opens in ghdeck over that pane, and `q` puts you back. Links on GitHub Enterprise work too when `GH_HOST`
+  names it; links on other hosts open in the browser as before. (Herdr routes clicks to plugins while
   `ui.mouse_capture` is on.)
 
 - **opens interactive commands in a pane below** (`gh issue create`, `gh pr create` for a branch not pushed yet,
