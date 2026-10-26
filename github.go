@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -1370,4 +1372,72 @@ func setLabels(repo string, number int, labels []string) error {
 		labels = []string{}
 	}
 	return ghWrite("PUT", fmt.Sprintf("repos/%s/issues/%d/labels", repo, number), map[string]any{"labels": labels}, nil)
+}
+
+// ---- inbox ----
+
+// Notification is one thread in your GitHub inbox, from any repository.
+type Notification struct {
+	ID      string
+	Repo    string // owner/name
+	Kind    string // PullRequest, Issue, Release, Discussion, CheckSuite, Commit, …
+	Title   string
+	Reason  string // review_requested, mention, assign, author, comment, ci_activity, …
+	Unread  bool
+	Updated time.Time
+	Number  int    // the pull request's or issue's, when it is one
+	URL     string // on github.com
+}
+
+var subjectNumber = regexp.MustCompile(`/(pulls|issues)/(\d+)$`)
+
+// fetchNotifications reads your inbox, unread only unless all. GitHub answers an unchanged inbox with 304, which
+// costs nothing.
+func fetchNotifications(all bool) ([]Notification, error) {
+	var resp []struct {
+		ID      string    `json:"id"`
+		Reason  string    `json:"reason"`
+		Unread  bool      `json:"unread"`
+		Updated time.Time `json:"updated_at"`
+		Subject struct {
+			Title string `json:"title"`
+			URL   string `json:"url"`
+			Type  string `json:"type"`
+		} `json:"subject"`
+		Repository struct {
+			FullName string `json:"full_name"`
+			URL      string `json:"html_url"`
+		} `json:"repository"`
+	}
+	if err := ghGet(fmt.Sprintf("notifications?all=%t&per_page=50", all), &resp); err != nil {
+		return nil, err
+	}
+	var out []Notification
+	for _, r := range resp {
+		n := Notification{ID: clean(r.ID), Repo: clean(r.Repository.FullName), Kind: clean(r.Subject.Type),
+			Title: clean(r.Subject.Title), Reason: clean(r.Reason), Unread: r.Unread, Updated: r.Updated,
+			URL: clean(r.Repository.URL)}
+		if m := subjectNumber.FindStringSubmatch(r.Subject.URL); m != nil {
+			n.Number, _ = strconv.Atoi(m[2])
+			path := "issues"
+			if n.Kind == "PullRequest" {
+				path = "pull"
+			}
+			n.URL = fmt.Sprintf("%s/%s/%d", n.URL, path, n.Number)
+		} else if n.Kind == "CheckSuite" {
+			n.URL += "/actions"
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+// markRead marks a notification read; markDone takes it out of the inbox.
+func markRead(id string) error { return inboxWrite("PATCH", id) }
+func markDone(id string) error { return inboxWrite("DELETE", id) }
+
+func inboxWrite(method, id string) error {
+	err := ghWrite(method, "notifications/threads/"+id, nil, nil)
+	gh.forget("notifications") // the inbox changed: ask again, not from the last answer
+	return err
 }

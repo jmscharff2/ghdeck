@@ -594,3 +594,29 @@ func TestSidebarText(t *testing.T) {
 		}
 	}
 }
+
+func TestInboxTab(t *testing.T) {
+	m := newModel(Repo{Slug: "me/app", Root: "/src/app"})
+	m.tab = tabInbox
+	m.panels[kInbox] = &panel{val: []Notification{
+		{ID: "1", Repo: "other/lib", Kind: "PullRequest", Number: 9, Title: "Fix", Reason: "review_requested", Unread: true},
+		{ID: "2", Repo: "Me/App", Kind: "Issue", Number: 3, Title: "Bug", Reason: "mention"},
+	}}
+	m.w, m.h = 120, 30
+	if n, r, ok := m.inboxSelected(); !ok || n.Number != 9 || r.Root != "" || r.Slug != "other/lib" {
+		t.Errorf("another repository's notification opens there, without this checkout: %+v %+v", n, r)
+	}
+	m.sel[tabInbox] = 1
+	if _, r, _ := m.inboxSelected(); r.Root != "/src/app" {
+		t.Errorf("this repository's notification keeps the checkout: %+v", r)
+	}
+	if _, ok := m.selected(); ok {
+		t.Error("the inbox has no selected item for the repository's own keys")
+	}
+	out := m.View()
+	for _, want := range []string{"4 Inbox 1", "other/lib", "review", "#9 Fix"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("inbox lacks %q:\n%s", want, out)
+		}
+	}
+}

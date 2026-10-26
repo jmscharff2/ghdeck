@@ -11,14 +11,15 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// The three lists, in tab order.
+// The lists, in tab order: the repository's three, then your inbox from every repository.
 const (
 	tabPRs = iota
 	tabIssues
 	tabRuns
+	tabInbox
 )
 
-var tabNames = []string{"Pull requests", "Issues", "Actions"}
+var tabNames = []string{"Pull requests", "Issues", "Actions", "Inbox"}
 
 // Data keys.
 const (
@@ -26,6 +27,7 @@ const (
 	kPRs    = "prs"
 	kIssues = "issues"
 	kRuns   = "runs"
+	kInbox  = "inbox"
 )
 
 type panel struct {
@@ -68,10 +70,11 @@ type model struct {
 	branch   string
 	panels   map[string]*panel
 	tab      int
-	sel      [3]int
+	sel      [4]int
 	filter   [2]int    // the preset search for pull requests and issues
 	search   [2]string // a search typed with /, replacing the preset
 	runsMine bool      // Actions shows only the current branch's runs
+	inboxAll bool      // the inbox shows read notifications too
 
 	typing bool
 	draft  string
@@ -200,6 +203,12 @@ func (m model) refreshStatus() tea.Cmd {
 }
 
 func (m model) listQuery(tab int) string {
+	if tab == tabInbox {
+		if m.inboxAll {
+			return "all"
+		}
+		return "unread"
+	}
 	if tab == tabRuns {
 		if m.runsMine {
 			return m.branch
@@ -216,6 +225,9 @@ func (m model) listQuery(tab int) string {
 func (m model) refreshTab(tab int) tea.Cmd {
 	q := m.listQuery(tab)
 	switch tab {
+	case tabInbox:
+		m.mark(kInbox, q)
+		return load(kInbox, q, func() (any, error) { return fetchNotifications(q == "all") })
 	case tabRuns:
 		repo := m.repo.Slug
 		m.mark(kRuns, q)
@@ -262,6 +274,28 @@ func (m model) runs() []Run {
 	return nil
 }
 
+func (m model) inbox() []Notification {
+	if p := m.panels[kInbox]; p != nil {
+		n, _ := p.val.([]Notification)
+		return n
+	}
+	return nil
+}
+
+// inboxSelected is the chosen notification, with the repository it belongs to: this one, with its checkout, or another.
+func (m model) inboxSelected() (Notification, Repo, bool) {
+	ns := m.inbox()
+	if m.tab != tabInbox || m.sel[tabInbox] >= len(ns) {
+		return Notification{}, Repo{}, false
+	}
+	n := ns[m.sel[tabInbox]]
+	r := Repo{Slug: n.Repo}
+	if strings.EqualFold(n.Repo, m.repo.Slug) {
+		r = m.repo
+	}
+	return n, r, true
+}
+
 func (m model) status() Status {
 	if p := m.panels[kStatus]; p != nil {
 		s, _ := p.val.(Status)
@@ -271,15 +305,18 @@ func (m model) status() Status {
 }
 
 func (m model) rows() int {
-	if m.tab == tabRuns {
+	switch m.tab {
+	case tabRuns:
 		return len(m.runs())
+	case tabInbox:
+		return len(m.inbox())
 	}
 	l, _ := m.list(m.tab)
 	return len(l.Items)
 }
 
 func (m model) selected() (Item, bool) {
-	if m.tab == tabRuns {
+	if m.tab == tabRuns || m.tab == tabInbox {
 		return Item{}, false
 	}
 	l, _ := m.list(m.tab)
@@ -553,7 +590,7 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.switchTab((m.tab + 1) % len(tabNames))
 	case "shift+tab", "left", "H":
 		return m.switchTab((m.tab + len(tabNames) - 1) % len(tabNames))
-	case "1", "2", "3":
+	case "1", "2", "3", "4":
 		return m.switchTab(int(key[0] - '1'))
 	case "r":
 		m.say("refreshing", false)
@@ -575,6 +612,11 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "pgup", "ctrl+u":
 		m.sel[m.tab] = max(0, m.sel[m.tab]-10)
 	case "f":
+		if m.tab == tabInbox {
+			m.inboxAll = !m.inboxAll
+			m.sel[m.tab] = 0
+			return m, m.refreshTab(m.tab)
+		}
 		if m.tab == tabRuns {
 			m.runsMine = !m.runsMine
 			m.sel[m.tab] = 0
@@ -588,15 +630,18 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.search[m.tab], m.sel[m.tab] = "", 0
 		return m, m.refreshTab(m.tab)
 	case "/":
-		if m.tab != tabRuns {
+		if m.tab == tabPRs || m.tab == tabIssues {
 			m.typing, m.draft = true, m.search[m.tab]
 		}
 	case "esc":
-		if m.tab != tabRuns && m.search[m.tab] != "" {
+		if (m.tab == tabPRs || m.tab == tabIssues) && m.search[m.tab] != "" {
 			m.search[m.tab], m.sel[m.tab] = "", 0
 			return m, m.refreshTab(m.tab)
 		}
 	case "enter":
+		if n, r, ok := m.inboxSelected(); ok {
+			return m, openNotification(n, r, false)
+		}
 		if m.tab == tabRuns {
 			if runs := m.runs(); m.sel[m.tab] < len(runs) {
 				return m, pushView(newRunView(m.repo, runs[m.sel[m.tab]].ID))
@@ -606,7 +651,20 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if it, ok := m.selected(); ok {
 			return m, pushView(newItemView(m.repo, it))
 		}
+	case "x":
+		if n, _, ok := m.inboxSelected(); ok {
+			id := n.ID
+			return m, func() tea.Msg {
+				if err := markDone(id); err != nil {
+					return actionMsg{err: err}
+				}
+				return actionMsg{text: "done: " + n.Title, refresh: true}
+			}
+		}
 	case "d":
+		if n, r, ok := m.inboxSelected(); ok && n.Kind == "PullRequest" && n.Number > 0 {
+			return m, openNotification(n, r, true)
+		}
 		if it, ok := m.selected(); ok && it.IsPR {
 			return m, pushView(newDiffView(m.repo, it.Number, it.Title))
 		}
@@ -620,6 +678,9 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.say("no open pull request for "+m.branch+" · n to create one", false)
 		}
 	case "o":
+		if n, _, ok := m.inboxSelected(); ok {
+			return m, openURL(n.URL)
+		}
 		if m.tab == tabRuns {
 			if runs := m.runs(); m.sel[m.tab] < len(runs) {
 				return m, openURL(runs[m.sel[m.tab]].URL)
@@ -804,9 +865,23 @@ func (m model) View() string {
 			style = sTabOn
 		}
 		label := fmt.Sprintf("%d %s", i+1, name)
-		if i != tabRuns {
+		switch i {
+		case tabPRs, tabIssues:
 			if l, p := m.list(i); p != nil && p.val != nil {
 				label += fmt.Sprintf(" %d", l.Total)
+			}
+		case tabInbox:
+			unread := 0
+			for _, n := range m.inbox() {
+				if n.Unread {
+					unread++
+				}
+			}
+			if unread > 0 {
+				label += fmt.Sprintf(" %d", unread)
+				if len(m.inbox()) >= 50 && !m.inboxAll {
+					label += "+" // a page of them; there may be more
+				}
 			}
 		}
 		tabs = append(tabs, style.Render(label))
@@ -824,9 +899,12 @@ func (m model) View() string {
 	foot := m.footer()
 	bodyH := max(1, m.h-len(head)-lipgloss.Height(foot))
 	var body []string
-	if m.tab == tabRuns {
+	switch m.tab {
+	case tabRuns:
 		body = m.runRows(bodyH)
-	} else {
+	case tabInbox:
+		body = m.inboxRows(bodyH)
+	default:
 		body = m.itemRows(bodyH)
 	}
 	for len(body) < bodyH {
@@ -881,6 +959,12 @@ func (m model) filterLine() string {
 	var what string
 	var p *panel
 	switch m.tab {
+	case tabInbox:
+		what = "unread, from every repository"
+		if m.inboxAll {
+			what = "everything, from every repository"
+		}
+		p = m.panels[kInbox]
 	case tabRuns:
 		what = "all branches"
 		if m.runsMine {
@@ -983,6 +1067,112 @@ func (m model) itemRow(it Item, on bool) string {
 	return cursor + num + state + " " + mark + style.Render(pad(truncate(title, max(8, avail)), max(8, avail))) + " " + tail
 }
 
+// inboxRows draws your notifications: unread first in weight, each with its repository, kind, and why it came.
+func (m model) inboxRows(h int) []string {
+	ns := m.inbox()
+	p := m.panels[kInbox]
+	var out []string
+	if p != nil && p.err != nil {
+		out = append(out, sBad.Render(" "+truncate(errText(p.err), m.w-2)))
+		h--
+	}
+	if len(ns) == 0 {
+		switch {
+		case p == nil || p.loading && p.val == nil:
+			return append(out, sMuted.Render(" loading…"))
+		case p.err == nil && m.inboxAll:
+			return append(out, sMuted.Render(" no notifications"))
+		case p.err == nil:
+			return append(out, sMuted.Render(" nothing unread · f shows everything"))
+		}
+		return out
+	}
+	sel := m.sel[tabInbox]
+	start := scrollStart(sel, len(ns), h)
+	repoW := 22
+	if m.w < 100 {
+		repoW = 14
+	}
+	for i := start; i < len(ns) && i < start+h; i++ {
+		n := ns[i]
+		cursor := "  "
+		if i == sel {
+			cursor = sTitle.Render("▸ ")
+		}
+		dot := "  "
+		title := lipgloss.NewStyle()
+		if n.Unread {
+			dot, title = sTitle.Render("● "), sBold
+		} else {
+			title = sMuted
+		}
+		left := cursor + dot + notificationKind(n.Kind) + " " + sMuted.Render(pad(truncate(n.Repo, repoW), repoW)) + " "
+		tail := sMuted.Render(pad(truncate(reasonWord(n.Reason), 10), 10) + " " + pad(age(n.Updated), 4))
+		avail := max(8, m.w-lipgloss.Width(left+tail)-2)
+		what := n.Title
+		if n.Number > 0 {
+			what = fmt.Sprintf("#%d %s", n.Number, n.Title)
+		}
+		out = append(out, left+title.Render(pad(truncate(what, avail), avail))+" "+tail)
+	}
+	return out
+}
+
+func notificationKind(kind string) string {
+	switch kind {
+	case "PullRequest":
+		return sGood.Render("PR")
+	case "Issue":
+		return sWarn.Render("IS")
+	case "Release":
+		return sMerged.Render("RL")
+	case "CheckSuite":
+		return sBad.Render("CI")
+	case "Discussion":
+		return sMuted.Render("DI")
+	}
+	return sMuted.Render("··")
+}
+
+// reasonWord is why a notification came, in a word or two.
+func reasonWord(r string) string {
+	switch r {
+	case "review_requested":
+		return "review"
+	case "mention", "team_mention":
+		return "mentioned"
+	case "assign":
+		return "assigned"
+	case "author":
+		return "yours"
+	case "ci_activity":
+		return "checks"
+	case "state_change":
+		return "state"
+	case "subscribed", "manual":
+		return "watching"
+	}
+	return strings.ReplaceAll(r, "_", " ")
+}
+
+// openNotification opens a notification's pull request or issue (its diff, with diff), whatever repository it is in,
+// and marks it read. Anything else opens on GitHub.
+func openNotification(n Notification, r Repo, diff bool) tea.Cmd {
+	read := func() tea.Msg {
+		if n.Unread {
+			_ = markRead(n.ID)
+		}
+		return refreshNowMsg{}
+	}
+	if n.Number == 0 || n.Kind != "PullRequest" && n.Kind != "Issue" {
+		return tea.Batch(openURL(n.URL), read)
+	}
+	if diff {
+		return tea.Batch(pushView(newDiffView(r, n.Number, n.Title)), read)
+	}
+	return tea.Batch(pushView(newItemView(r, Item{Number: n.Number, Title: n.Title, IsPR: n.Kind == "PullRequest", URL: n.URL})), read)
+}
+
 func (m model) runRows(h int) []string {
 	runs := m.runs()
 	p := m.panels[kRuns]
@@ -1041,8 +1231,10 @@ func (m model) footer() string {
 		keys = append(keys, [2]string{"f", "filter"}, [2]string{"/", "search"})
 	case tabRuns:
 		keys = append(keys, [2]string{"f", "this branch"})
+	case tabInbox:
+		keys = append(keys, [2]string{"d", "diff"}, [2]string{"x", "done"}, [2]string{"f", "unread/all"}, [2]string{"o", "web"})
 	}
-	if inHerdr() && m.tab != tabRuns {
+	if inHerdr() && (m.tab == tabPRs || m.tab == tabIssues) {
 		keys = append(keys, [2]string{"a", "agent"})
 	}
 	keys = append(keys, [2]string{"?", "more"}, [2]string{"q", "quit"})
@@ -1053,7 +1245,7 @@ func (m model) footer() string {
 		}
 		b.WriteString(sMuted.Render(fmt.Sprintf(" Interactive commands (gh pr create, checkout) open %s.", where)) + "\n")
 		keys = [][2]string{{"b", "your branch's PR"}, {"n", "new PR / issue"}, {"C", "check out PR"}, {"W", "PR in a worktree"},
-			{"o", "open on GitHub"}, {"r", "refresh"}, {"A", "gh sign in"}, {"1-3", "jump to list"}, {"?", "back"}}
+			{"o", "open on GitHub"}, {"r", "refresh"}, {"A", "gh sign in"}, {"1-4", "jump to list"}, {"?", "back"}}
 	}
 	b.WriteString(keyHelp(keys, m.w))
 	return b.String()

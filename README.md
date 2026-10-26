@@ -111,6 +111,10 @@ they are open, review requested, mine and closed; for issues, open, assigned to 
 GitHub search (`label:bug author:sam`, `is:merged`, `sort:created-asc`) in place of the preset. The header shows your
 branch's pull request with its checks and review state, and how many pull requests are waiting on your review.
 
+**Your inbox** (`4`). Your GitHub notifications from every repository, unread first (`f` shows everything): review
+requests, mentions, assignments, failed runs. `enter` opens a pull request or issue in ghdeck, whichever repository it
+is in, and marks it read; `d` opens a pull request's diff; `x` marks it done.
+
 **A pull request.** Its merge state, a summary of its checks and reviewers, the description, the checks (failing
 ones first), unresolved review threads, and the conversation: comments, reviews, commits, merges.
 
@@ -146,9 +150,10 @@ a header for each step.
 
 | Key | Does |
 |---|---|
-| `tab` `shift+tab` `1`-`3` | pull requests, issues, Actions |
+| `tab` `shift+tab` `1`-`4` | pull requests, issues, Actions, your inbox |
 | `↑` `↓` `enter` | choose and open |
-| `f` | next filter (Actions: all branches, or this one) |
+| `f` | next filter (Actions: all branches, or this one; inbox: unread, or everything) |
+| `x` | inbox: mark the notification done |
 | `/` | search with GitHub's syntax; `esc` clears it |
 | `d` | the chosen pull request's diff |
 | `b` | your branch's pull request |
