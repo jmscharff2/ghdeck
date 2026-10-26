@@ -412,6 +412,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(cmds...)
 	case refreshNowMsg:
+		sharedRefresh() // after an action: what changed, from GitHub
 		cmds := []tea.Cmd{m.refreshStatus(), m.refreshTab(m.tab)}
 		if n := len(m.stack); n > 0 {
 			if r, ok := m.stack[n-1].(refresher); ok {
@@ -594,6 +595,7 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.switchTab(int(key[0] - '1'))
 	case "r":
 		m.say("refreshing", false)
+		sharedRefresh() // from GitHub, not another deck's answer
 		return m, tea.Batch(m.refreshStatus(), m.refreshTab(m.tab))
 	case "j", "down":
 		if m.sel[m.tab] < m.rows()-1 {
@@ -708,7 +710,7 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "W":
 		if it, ok := m.selected(); ok && it.IsPR {
-			return m, worktreeCmd(m.repo, it.Number)
+			return m, worktreeCmd(m.repo, it.Number, it.HeadSHA)
 		}
 	case "w":
 		if it, ok := m.selected(); ok && it.IsPR && it.State == "OPEN" {
@@ -758,24 +760,38 @@ func checkoutCmd(r Repo, number int) (tea.Cmd, string) {
 
 // worktreeCmd checks a pull request out in a worktree beside this checkout and, in Herdr, opens it as a workspace:
 // a place to run it or hand it to an agent without touching what you have checked out. An existing one is reused.
-func worktreeCmd(r Repo, number int) tea.Cmd {
+func worktreeCmd(r Repo, number int, sha string) tea.Cmd {
 	if r.Root == "" {
 		return func() tea.Msg { return actionMsg{err: errors.New("no checkout here to make a worktree from")} }
 	}
 	path := fmt.Sprintf("%s-pr-%d", r.Root, number)
-	script := fmt.Sprintf(`set -e
-p=%s
-if [ ! -d "$p" ]; then
-  git worktree add --detach "$p"
-  cd "$p" && gh pr checkout %d -R %s
-  cd - >/dev/null
-fi
-echo "worktree: $p"`, shellQuote(path), number, shellQuote(r.Slug))
+	script := worktreeScript(path, number, r.Slug, sha) + `
+echo "worktree: $p"`
 	if inHerdr() {
 		script += fmt.Sprintf("\n%s worktree open --cwd %s --path \"$p\" --focus >/dev/null && echo 'opened as a Herdr workspace'",
 			shellQuote(herdrBin()), shellQuote(r.Root))
 	}
 	return viewAction(fmt.Sprintf("worktree for #%d", number), r.Root, script, false)
+}
+
+// worktreeScript makes, or brings back, the worktree for a pull request at path. A worktree is right when it has the
+// pull request's head commit (sha; unknown when ""), its own commits on top allowed; one left half-made by a failed
+// checkout, or behind, gets gh pr checkout again, and the script fails if it still is not right.
+func worktreeScript(path string, number int, repo, sha string) string {
+	return fmt.Sprintf(`set -e
+p=%s
+sha=%s
+at_head() { [ -n "$sha" ] && git -C "$p" merge-base --is-ancestor "$sha" HEAD 2>/dev/null; }
+if [ ! -d "$p" ]; then
+  git worktree add --detach "$p"
+fi
+if ! at_head; then
+  (cd "$p" && gh pr checkout %d -R %s)
+fi
+if [ -n "$sha" ] && ! at_head; then
+  echo "the worktree at $p is not on the pull request's head ($sha)" >&2
+  exit 1
+fi`, shellQuote(path), shellQuote(sha), number, shellQuote(repo))
 }
 
 // itemPrompt asks an agent to take on a pull request or an issue. It names the item and points at gh for the rest

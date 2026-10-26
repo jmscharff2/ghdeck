@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textarea"
@@ -280,12 +281,28 @@ func (p *picker) Update(msg tea.Msg) (bool, tea.Cmd) {
 			p.sel = max(0, min(len(shown)-1, p.sel+1))
 		case "enter":
 			if p.multi {
+				// Nothing to apply until the choices are in: enter now would drop what is ticked but not yet listed.
+				if p.loading || p.err != nil {
+					return true, nil
+				}
 				var out []string
+				offered := map[string]bool{}
 				for _, o := range p.opts { // in the order offered
-					if k := or(o.match, o.label); p.ticked[k] {
+					k := or(o.match, o.label)
+					offered[k] = true
+					if p.ticked[k] {
 						out = append(out, k)
 					}
 				}
+				// Ticked from the start but not among the choices (a label past the first hundred, say): kept as it is.
+				var kept []string
+				for k, on := range p.ticked {
+					if on && !offered[k] {
+						kept = append(kept, k)
+					}
+				}
+				sort.Strings(kept)
+				out = append(out, kept...)
 				if p.done == nil {
 					return false, nil
 				}

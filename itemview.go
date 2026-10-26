@@ -129,6 +129,7 @@ func (v *itemView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 	case "G", "end":
 		v.scroll = 1 << 30
 	case "r":
+		sharedRefresh()
 		return true, v.fetch()
 	case "o":
 		return true, openURL(it.URL)
@@ -215,7 +216,11 @@ func (v *itemView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 		}
 	case "W":
 		if it.IsPR {
-			return true, worktreeCmd(v.repo, it.Number)
+			sha := it.HeadSHA
+			if v.d != nil {
+				sha = v.d.HeadSHA
+			}
+			return true, worktreeCmd(v.repo, it.Number, sha)
 		}
 	case "w":
 		if it.IsPR && it.State == "OPEN" && v.d != nil {

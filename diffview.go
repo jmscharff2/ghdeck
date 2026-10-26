@@ -112,8 +112,9 @@ type diffView struct {
 	err     error
 
 	// since shows only what changed since your last review (S); all keeps the whole pull request meanwhile.
-	since bool
-	all   []File
+	since        bool
+	sinceLoading bool
+	all          []File
 
 	file   int
 	cursor int // index into the file's lines
@@ -191,8 +192,12 @@ func (v *diffView) Update(msg tea.Msg) (bool, tea.Cmd) {
 			v.title = msg.title
 		}
 		if msg.files != nil {
+			if v.since && msg.sha != v.sha { // new commits: what changed since the review is out of date
+				v.since, v.all = false, nil
+				v.note = "new commits since you opened this · showing everything; S compares with your review again"
+			}
 			if v.since { // keep showing what changed since the review; the whole is for when S goes back
-				v.all, v.sha = msg.files, msg.sha
+				v.all = msg.files
 			} else {
 				changed := len(msg.files) != len(v.files) || msg.sha != v.sha
 				v.files, v.sha = msg.files, msg.sha
@@ -204,12 +209,15 @@ func (v *diffView) Update(msg tea.Msg) (bool, tea.Cmd) {
 			v.threads = groupThreads(msg.comments)
 		}
 	case sinceMsg:
-		v.loading = false
+		v.loading, v.sinceLoading = false, false
 		if msg.err != nil {
 			v.note = "can't compare with your last review: " + errText(msg.err)
 			return true, nil
 		}
-		v.all, v.files, v.since = v.files, msg.files, true
+		if !v.since {
+			v.all = v.files
+		}
+		v.files, v.since = msg.files, true
 		v.parsed, v.file, v.cursor, v.scroll = map[int][]diffLine{}, 0, 0, 0
 		v.note = fmt.Sprintf("%d file(s) changed since your last review · S shows everything", len(v.files))
 	case draftDeleteMsg:
@@ -351,6 +359,7 @@ func (v *diffView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 	case "f":
 		return true, pushView(v.filePicker())
 	case "r":
+		sharedRefresh()
 		return true, v.fetch()
 	case "o":
 		return true, openURL(fmt.Sprintf("https://github.com/%s/pull/%d/files", v.repo.Slug, v.number))
@@ -464,6 +473,11 @@ func (v *diffView) applySuggestion() tea.Cmd {
 	ts, _ := v.threadsAt(v.cursor)
 	var c *ReviewComment
 	for _, t := range ts {
+		// A suggestion replaces lines of the new file, so only a thread on that side has one to apply: the line
+		// numbers of a comment on a removed line are the base file's.
+		if or(t.root.Side, "RIGHT") != "RIGHT" || or(t.root.StartSide, "RIGHT") != "RIGHT" {
+			continue
+		}
 		for _, rc := range append([]ReviewComment{t.root}, t.replies...) {
 			if _, ok := suggestionIn(rc.Body); ok {
 				rc := rc
@@ -472,7 +486,7 @@ func (v *diffView) applySuggestion() tea.Cmd {
 		}
 	}
 	if c == nil {
-		v.note = "no suggested change on this line"
+		v.note = "no suggested change to the new code on this line"
 		return nil
 	}
 	root := v.repo.Root
@@ -489,13 +503,29 @@ func (v *diffView) applySuggestion() tea.Cmd {
 		v.note = path + " has changes you have not committed · commit or stash them first, so the lines match"
 		return nil
 	}
-	start, end := c.StartLine, c.Line
+	start, end := c.StartLine, v.threadLine(*c, ts)
 	if start == 0 {
 		start = end
 	}
+	// The lines as the diff shows them, which the file must still read as.
+	shown := map[int]string{}
+	for _, l := range v.lines() {
+		if l.kind == '+' || l.kind == ' ' {
+			shown[l.new] = l.text
+		}
+	}
+	var want []string
+	for n := start; n <= end; n++ {
+		t, ok := shown[n]
+		if !ok {
+			v.note = fmt.Sprintf("line %d is outside the diff, so ghdeck can't check it · apply this one on GitHub", n)
+			return nil
+		}
+		want = append(want, t)
+	}
 	v.ask = newConfirmation(fmt.Sprintf("Apply %s's suggestion to %s:%d-%d in your checkout?", c.User.Login, path, start, end),
 		func() tea.Msg {
-			if err := applySuggestion(root, path, start, end, c.Body); err != nil {
+			if err := applySuggestion(root, path, start, end, want, c.Body); err != nil {
 				return actionMsg{err: err}
 			}
 			return actionMsg{text: fmt.Sprintf("applied to %s · commit and push it to send the change", path)}
@@ -503,19 +533,45 @@ func (v *diffView) applySuggestion() tea.Cmd {
 	return nil
 }
 
-// applySuggestion replaces lines start through end of a file in the checkout with a comment's suggestion.
-func applySuggestion(root, path string, start, end int, body string) error {
+// threadLine is where a comment's thread sits: a reply carries no line of its own, so it takes its thread's.
+func (v *diffView) threadLine(c ReviewComment, ts []thread) int {
+	if c.Line != 0 {
+		return c.Line
+	}
+	for _, t := range ts {
+		if t.root.ID == c.ReplyTo {
+			return t.root.Line
+		}
+	}
+	return 0
+}
+
+// applySuggestion replaces lines start through end of a file in the checkout with a comment's suggestion, when they
+// still read as want. The file is the pull request's, so its name is untrusted: it must be a plain file whose real
+// path, symlinks followed, is inside the checkout.
+func applySuggestion(root, path string, start, end int, want []string, body string) error {
 	repl, ok := suggestionIn(body)
 	if !ok {
 		return fmt.Errorf("no suggestion in the comment")
 	}
 	full := filepath.Join(root, filepath.FromSlash(path))
-	if rel, err := filepath.Rel(root, full); err != nil || strings.HasPrefix(rel, "..") {
+	if rel, err := filepath.Rel(root, full); err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
 		return fmt.Errorf("%s is outside the checkout", path)
 	}
-	info, err := os.Stat(full)
+	info, err := os.Lstat(full)
 	if err != nil {
 		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a plain file (a symlink, say), so ghdeck won't write it", path)
+	}
+	realRoot, err1 := filepath.EvalSymlinks(root)
+	realFull, err2 := filepath.EvalSymlinks(full)
+	if err1 != nil || err2 != nil {
+		return fmt.Errorf("can't resolve %s in the checkout", path)
+	}
+	if rel, err := filepath.Rel(realRoot, realFull); err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
+		return fmt.Errorf("%s leads outside the checkout", path)
 	}
 	b, err := os.ReadFile(full)
 	if err != nil {
@@ -526,6 +582,11 @@ func applySuggestion(root, path string, start, end int, body string) error {
 	lines := strings.Split(strings.TrimSuffix(text, "\n"), "\n")
 	if start < 1 || end < start || end > len(lines) {
 		return fmt.Errorf("%s has %d lines; the suggestion is for %d-%d", path, len(lines), start, end)
+	}
+	for i, w := range want {
+		if strings.TrimRight(lines[start-1+i], "\r") != w {
+			return fmt.Errorf("%s:%d no longer reads as the diff shows it; nothing was changed", path, start+i)
+		}
 	}
 	out := append(append(append([]string{}, lines[:start-1]...), repl...), lines[end:]...)
 	text = strings.Join(out, "\n")
@@ -627,7 +688,10 @@ func (v *diffView) toggleSince() tea.Cmd {
 		v.note = "nothing new since your last review"
 		return nil
 	}
-	v.loading = true
+	if v.sinceLoading {
+		return nil
+	}
+	v.loading, v.sinceLoading = true, true
 	id, repo, from, to := v.id, v.repo.Slug, v.state.LastReview, v.sha
 	return func() tea.Msg {
 		files, err := fetchFilesSince(repo, from, to)

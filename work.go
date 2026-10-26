@@ -80,14 +80,13 @@ func workCmd(r Repo, it Item, d *Detail, prompt string) tea.Cmd {
 			return fail(errors.New("no checkout here to make a worktree from"))
 		}
 		path := fmt.Sprintf("%s-pr-%d", r.Root, it.Number)
-		script := fmt.Sprintf(`set -e
-p=%s
-if [ ! -d "$p" ]; then
-  git worktree add --detach "$p" >/dev/null 2>&1
-  cd "$p" && gh pr checkout %d -R %s >/dev/null 2>&1
-fi`, shellQuote(path), it.Number, shellQuote(r.Slug))
-		if _, err := runIn(r.Root, "sh", "-c", script); err != nil {
-			return fail(fmt.Errorf("making the worktree at %s: %w", path, err))
+		sha := it.HeadSHA
+		if d != nil {
+			sha = or(d.HeadSHA, sha)
+		}
+		script := worktreeScript(path, it.Number, r.Slug, sha)
+		if out, err := runIn(r.Root, "sh", "-c", script); err != nil {
+			return fail(fmt.Errorf("making the worktree at %s: %w %s", path, err, strings.TrimSpace(string(out))))
 		}
 		out, err := run(herdrBin(), "worktree", "open", "--cwd", r.Root, "--path", path,
 			"--label", fmt.Sprintf("#%d %s", it.Number, truncate(it.Title, 30)), "--focus")

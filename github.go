@@ -199,17 +199,12 @@ type Status struct {
 
 func fetchStatus(repo, branch string, watched ...int) (Status, error) {
 	owner, name, _ := strings.Cut(repo, "/")
-	var w strings.Builder
-	for _, n := range watched {
-		fmt.Fprintf(&w, "w%d: pullRequest(number: %d) { __typename %s }\n", n, n, prFields)
-	}
 	q := `query($o: String!, $n: String!, $b: String!, $rq: String!, $hasBranch: Boolean!) {
 		viewer { login }
 		repository(owner: $o, name: $n) {
 			pullRequests(headRefName: $b, first: 1, states: [OPEN], orderBy: {field: UPDATED_AT, direction: DESC}) @include(if: $hasBranch) {
 				nodes { __typename ` + prFields + ` }
 			}
-			` + w.String() + `
 		}
 		review: search(query: $rq, type: ISSUE, first: 20) { nodes {` + itemFields + `} }
 	}`
@@ -224,27 +219,14 @@ func fetchStatus(repo, branch string, watched ...int) (Status, error) {
 			Nodes []gqlItem `json:"nodes"`
 		} `json:"review"`
 	}
-	var raw struct {
-		Repository map[string]json.RawMessage `json:"repository"`
-	}
-	var data json.RawMessage
 	err := ghQuery(q, map[string]any{
 		"o": owner, "n": name, "b": branch, "hasBranch": branch != "",
 		"rq": "repo:" + repo + " is:pr is:open review-requested:@me",
-	}, &data)
+	}, &resp)
 	if err != nil {
 		return Status{}, err
 	}
-	if json.Unmarshal(data, &resp) != nil || json.Unmarshal(data, &raw) != nil {
-		return Status{}, fmt.Errorf("GitHub: unexpected answer")
-	}
-	s := Status{Viewer: clean(resp.Viewer.Login), Watched: map[int]Item{}}
-	for _, n := range watched {
-		var g gqlItem
-		if b := raw.Repository[fmt.Sprintf("w%d", n)]; len(b) > 0 && json.Unmarshal(b, &g) == nil && g.Number != 0 {
-			s.Watched[n] = g.item()
-		}
-	}
+	s := Status{Viewer: clean(resp.Viewer.Login), Watched: fetchWatched(owner, name, watched)}
 	if r := resp.Repository; r != nil && r.PRs != nil && len(r.PRs.Nodes) > 0 {
 		it := r.PRs.Nodes[0].item()
 		s.BranchPR = &it
@@ -255,6 +237,33 @@ func fetchStatus(repo, branch string, watched ...int) (Status, error) {
 		}
 	}
 	return s, nil
+}
+
+// fetchWatched reads the pull requests handed to agents, in a query of their own: one that can no longer be found
+// (deleted, or its repository moved) leaves the others, and the header, unharmed.
+func fetchWatched(owner, name string, numbers []int) map[int]Item {
+	out := map[int]Item{}
+	if len(numbers) == 0 {
+		return out
+	}
+	var w strings.Builder
+	for _, n := range numbers {
+		fmt.Fprintf(&w, "w%d: pullRequest(number: %d) { __typename %s }\n", n, n, prFields)
+	}
+	var raw struct {
+		Repository map[string]json.RawMessage `json:"repository"`
+	}
+	q := `query($o: String!, $n: String!) { repository(owner: $o, name: $n) { ` + w.String() + ` } }`
+	if ghQuery(q, map[string]any{"o": owner, "n": name}, &raw) != nil {
+		return out
+	}
+	for _, n := range numbers {
+		var g gqlItem
+		if b := raw.Repository[fmt.Sprintf("w%d", n)]; len(b) > 0 && json.Unmarshal(b, &g) == nil && g.Number != 0 {
+			out[n] = g.item()
+		}
+	}
+	return out
 }
 
 // ---- one pull request or issue in full ----
@@ -322,7 +331,7 @@ const detailQuery = `query($o: String!, $n: String!, $num: Int!) {
 				autoMergeRequest { mergeMethod enabledBy { login } }
 				author { login }
 				comments { totalCount }
-				labels(first: 20) { nodes { name } }
+				labels(first: 100) { nodes { name } }
 				assignees(first: 10) { nodes { login } }
 				reviewRequests(first: 10) { nodes { requestedReviewer { ... on User { login } ... on Team { name } } } }
 				latestReviews(first: 20) { nodes { author { login } state submittedAt } }
@@ -349,7 +358,7 @@ const detailQuery = `query($o: String!, $n: String!, $num: Int!) {
 				id number title state url body createdAt updatedAt
 				author { login }
 				comments { totalCount }
-				labels(first: 20) { nodes { name } }
+				labels(first: 100) { nodes { name } }
 				assignees(first: 10) { nodes { login } }
 				closedByPullRequestsReferences(first: 5) { nodes { number title state url } }
 				timelineItems(last: 60, itemTypes: [ISSUE_COMMENT, CLOSED_EVENT, REOPENED_EVENT]) {
@@ -662,6 +671,7 @@ type ReviewComment struct {
 	User      gqlLogin  `json:"user"`
 	CommitID  string    `json:"commit_id"`
 	StartLine int       `json:"start_line"` // the first line of a comment on several, else 0
+	StartSide string    `json:"start_side"`
 	Outdated  bool      `json:"-"`
 	Pending   bool      `json:"-"` // a draft of yours, not yet sent
 	DraftSide string    `json:"-"`
@@ -1095,7 +1105,7 @@ func fetchReviewState(repo string, number int) (*ReviewState, error) {
 				id
 				viewerLatestReview { commit { oid } }
 				files(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { path viewerViewedState } }
-				reviewThreads(first: 100) { nodes { id isResolved comments(first: 1) { nodes { databaseId } } } }
+				reviewThreads(first: 100) { pageInfo { hasNextPage endCursor } nodes { id isResolved comments(first: 1) { nodes { fullDatabaseId } } } }
 			}
 		}
 	}`
@@ -1121,17 +1131,7 @@ func fetchReviewState(repo string, number int) (*ReviewState, error) {
 							Viewed string `json:"viewerViewedState"`
 						} `json:"nodes"`
 					} `json:"files"`
-					Threads struct {
-						Nodes []struct {
-							ID       string `json:"id"`
-							Resolved bool   `json:"isResolved"`
-							Comments struct {
-								Nodes []struct {
-									DatabaseID int64 `json:"databaseId"`
-								} `json:"nodes"`
-							} `json:"comments"`
-						} `json:"nodes"`
-					} `json:"reviewThreads"`
+					Threads gqlThreads `json:"reviewThreads"`
 				} `json:"pullRequest"`
 			} `json:"repository"`
 		}
@@ -1150,9 +1150,10 @@ func fetchReviewState(repo string, number int) (*ReviewState, error) {
 			st.Viewed[clean(f.Path)] = f.Viewed == "VIEWED"
 		}
 		if page == 0 {
-			for _, t := range pr.Threads.Nodes {
-				if len(t.Comments.Nodes) > 0 {
-					st.Threads[t.Comments.Nodes[0].DatabaseID] = ThreadState{ID: t.ID, Resolved: t.Resolved}
+			st.add(pr.Threads)
+			if pr.Threads.PageInfo.Next {
+				if err := st.moreThreads(owner, name, number, pr.Threads.PageInfo.Cursor); err != nil {
+					return nil, err
 				}
 			}
 		}
@@ -1163,6 +1164,65 @@ func fetchReviewState(repo string, number int) (*ReviewState, error) {
 		after = &c
 	}
 	return st, nil
+}
+
+// gqlThreads is a page of review threads, each known by its first comment's id: the id REST gives the comment.
+type gqlThreads struct {
+	PageInfo struct {
+		Next   bool   `json:"hasNextPage"`
+		Cursor string `json:"endCursor"`
+	} `json:"pageInfo"`
+	Nodes []struct {
+		ID       string `json:"id"`
+		Resolved bool   `json:"isResolved"`
+		Comments struct {
+			Nodes []struct {
+				ID string `json:"fullDatabaseId"` // a BigInt, as a string: the 32-bit databaseId runs out
+			} `json:"nodes"`
+		} `json:"comments"`
+	} `json:"nodes"`
+}
+
+func (st *ReviewState) add(page gqlThreads) {
+	for _, t := range page.Nodes {
+		if len(t.Comments.Nodes) == 0 {
+			continue
+		}
+		if id, err := strconv.ParseInt(t.Comments.Nodes[0].ID, 10, 64); err == nil {
+			st.Threads[id] = ThreadState{ID: clean(t.ID), Resolved: t.Resolved}
+		}
+	}
+}
+
+// moreThreads reads the threads past the first hundred, a hundred at a time.
+func (st *ReviewState) moreThreads(owner, name string, number int, after string) error {
+	q := `query($o: String!, $n: String!, $num: Int!, $after: String) {
+		repository(owner: $o, name: $n) { pullRequest(number: $num) {
+			reviewThreads(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { id isResolved comments(first: 1) { nodes { fullDatabaseId } } } }
+		} }
+	}`
+	for page := 0; page < 20 && after != ""; page++ {
+		var resp struct {
+			Repository *struct {
+				PR *struct {
+					Threads gqlThreads `json:"reviewThreads"`
+				} `json:"pullRequest"`
+			} `json:"repository"`
+		}
+		if err := ghQuery(q, map[string]any{"o": owner, "n": name, "num": number, "after": after}, &resp); err != nil {
+			return err
+		}
+		if resp.Repository == nil || resp.Repository.PR == nil {
+			return nil
+		}
+		t := resp.Repository.PR.Threads
+		st.add(t)
+		after = ""
+		if t.PageInfo.Next {
+			after = t.PageInfo.Cursor
+		}
+	}
+	return nil
 }
 
 // setResolved resolves a review thread, or opens it again.

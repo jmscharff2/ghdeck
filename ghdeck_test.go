@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -424,7 +425,7 @@ func TestParseTarget(t *testing.T) {
 			t.Errorf("parseTarget(%q) = %+v %v, want %+v", in, got, ok, want)
 		}
 	}
-	for _, bad := range []string{"", "abc", "http://github.com/o/r/pull/7", "https://evil.example/o/r/pull/7", "https://github.com/o/r"} {
+	for _, bad := range []string{"", "abc", "foo/bar123", "http://github.com/o/r/pull/7", "https://evil.example/o/r/pull/7", "https://github.com/o/r"} {
 		if _, ok := parseTarget(bad); ok {
 			t.Errorf("parseTarget(%q) should refuse", bad)
 		}
@@ -452,17 +453,34 @@ func TestApplySuggestion(t *testing.T) {
 	if got, ok := suggestionIn(body); !ok || len(got) != 1 || got[0] != "2 and 3" {
 		t.Fatalf("suggestionIn = %q %v", got, ok)
 	}
-	if err := applySuggestion(dir, "a.go", 2, 3, body); err != nil {
+	if err := applySuggestion(dir, "a.go", 2, 3, []string{"two", "three"}, body); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(dir + "/a.go"); string(b) != "one\n2 and 3\nfour\n" {
 		t.Errorf("file = %q", b)
 	}
-	if err := applySuggestion(dir, "../outside.go", 1, 1, body); err == nil {
+	if err := applySuggestion(dir, "a.go", 1, 1, []string{"not what it says"}, body); err == nil {
+		t.Error("lines that no longer read as the diff should be refused")
+	}
+	if err := applySuggestion(dir, "../outside.go", 1, 1, []string{"x"}, body); err == nil {
 		t.Error("a path outside the checkout should be refused")
 	}
-	if err := applySuggestion(dir, "a.go", 2, 9, body); err == nil {
+	if err := applySuggestion(dir, "a.go", 2, 9, nil, body); err == nil {
 		t.Error("lines past the end should be refused")
+	}
+	// A pull request can add a symlink pointing anywhere; writing through it would edit that file.
+	outside := t.TempDir() + "/rc"
+	os.WriteFile(outside, []byte("keep\n"), 0o644)
+	os.Symlink(outside, dir+"/link")
+	if err := applySuggestion(dir, "link", 1, 1, []string{"keep"}, body); err == nil {
+		t.Error("a symlink should be refused")
+	}
+	os.Symlink(filepath.Dir(outside), dir+"/sub")
+	if err := applySuggestion(dir, "sub/rc", 1, 1, []string{"keep"}, body); err == nil {
+		t.Error("a path through a symlinked directory should be refused")
+	}
+	if b, _ := os.ReadFile(outside); string(b) != "keep\n" {
+		t.Errorf("the file outside was changed: %q", b)
 	}
 	if _, ok := suggestionIn("no suggestion here\n```go\nx\n```"); ok {
 		t.Error("an ordinary code block is not a suggestion")
@@ -555,7 +573,7 @@ func TestSharedAnswers(t *testing.T) {
 	gh.token = "token-a"
 	gh.mu.Unlock()
 	key := sharedKey([]byte(`{"query":"q"}`))
-	sharedPut(key, []byte(`{"data":{}}`))
+	sharedPut(key, []byte(`{"data":{}}`), time.Now())
 	if string(sharedGet(key)) != `{"data":{}}` {
 		t.Fatal("a fresh answer should be shared")
 	}
@@ -572,11 +590,27 @@ func TestSharedAnswers(t *testing.T) {
 	if sharedGet(key) != nil {
 		t.Error("a stale answer should not be shared")
 	}
-	sharedPut(key, []byte(`{"data":{}}`))
+	sharedPut(key, []byte(`{"data":{}}`), time.Now())
 	sharedClear()
 	if sharedGet(key) != nil {
 		t.Error("a write should clear the shared answers")
 	}
+	// A question asked before a write, answered after it, may describe the world before: not kept.
+	asked := time.Now().Add(-time.Second)
+	sharedPut(key, []byte(`{"data":{}}`), asked)
+	if sharedGet(key) != nil {
+		t.Error("an answer to a question asked before the last clear should not be shared")
+	}
+	time.Sleep(10 * time.Millisecond)
+	sharedPut(key, []byte(`{"data":{}}`), time.Now())
+	if sharedGet(key) == nil {
+		t.Fatal("an answer asked for after the clear should be shared")
+	}
+	sharedRefresh()
+	if sharedGet(key) != nil {
+		t.Error("a refresh you ask for should go to GitHub")
+	}
+	freshFrom.Store(0)
 	gh.mu.Lock()
 	gh.token = ""
 	gh.mu.Unlock()
@@ -619,4 +653,53 @@ func TestInboxTab(t *testing.T) {
 			t.Errorf("inbox lacks %q:\n%s", want, out)
 		}
 	}
+}
+
+// A worktree is right when it holds the pull request's head, its own commits on top allowed; a half-made one is not.
+func TestWorktreeScript(t *testing.T) {
+	dir := t.TempDir()
+	bin := t.TempDir()
+	os.WriteFile(bin+"/gh", []byte("#!/bin/sh\necho gh was asked >&2\nexit 1\n"), 0o755) // never the network
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	git := func(args ...string) string {
+		out, err := runIn(dir+"/repo", "git", args...)
+		if err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	os.MkdirAll(dir+"/repo", 0o755)
+	git("init", "-q")
+	git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "one")
+	head := git("rev-parse", "HEAD")
+	path := dir + "/repo-pr-1"
+	if _, err := runIn(dir+"/repo", "sh", "-c", worktreeScript(path, 1, "o/r", head)); err != nil {
+		t.Fatalf("a worktree at the head needs no checkout: %v", err)
+	}
+	runIn(path, "git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "agent's")
+	if _, err := runIn(dir+"/repo", "sh", "-c", worktreeScript(path, 1, "o/r", head)); err != nil {
+		t.Errorf("the agent's own commits on top are fine: %v", err)
+	}
+	if _, err := runIn(dir+"/repo", "sh", "-c", worktreeScript(path, 1, "o/r", strings.Repeat("a", 40))); err == nil {
+		t.Error("a worktree not on the head, where checkout fails, should be an error")
+	}
+}
+
+// The labels picker never drops a label it did not offer, nor applies anything before its choices load.
+func TestMultiPickerKeepsWhatItDidNotOffer(t *testing.T) {
+	var got []string
+	called := false
+	p := newMultiPicker("Labels", []string{"bug", "zz-old"}, func(ticked []string) tea.Cmd { called, got = true, ticked; return nil })
+	p.loading = true
+	if open, _ := p.Update(tea.KeyMsg{Type: tea.KeyEnter}); !open || called {
+		t.Fatal("enter while loading should do nothing")
+	}
+	p.Update(pickerLoadedMsg{id: p.id, opts: []option{{label: "bug"}, {label: "docs"}}}) // zz-old is past the first hundred
+	p.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if strings.Join(got, ",") != "bug,zz-old" {
+		t.Errorf("ticked = %q, want bug and the unlisted zz-old kept", got)
+	}
+	failed := newMultiPicker("Labels", []string{"bug"}, func([]string) tea.Cmd { t.Error("applied after a failed load"); return nil })
+	failed.Update(pickerLoadedMsg{id: failed.id, err: errors.New("rate limited")})
+	failed.Update(tea.KeyMsg{Type: tea.KeyEnter})
 }
