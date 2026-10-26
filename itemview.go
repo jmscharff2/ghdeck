@@ -87,11 +87,8 @@ func (v *itemView) Update(msg tea.Msg) (bool, tea.Cmd) {
 		if v.pending() {
 			every = 15 * time.Second
 		}
-		if lowBudget() {
-			every = 2 * time.Minute
-		}
 		id, gen := v.id, v.gen
-		return true, tea.Tick(every, func(time.Time) tea.Msg { return itemTickMsg{id, gen} })
+		return true, tea.Tick(pace(every), func(time.Time) tea.Msg { return itemTickMsg{id, gen} })
 	case itemTickMsg:
 		if msg.gen == v.gen {
 			return true, v.fetch()

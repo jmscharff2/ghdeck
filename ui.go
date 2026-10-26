@@ -49,7 +49,10 @@ type actionMsg struct {
 	refresh bool
 }
 
-type tickMsg struct{}
+type tickMsg struct{ gen int }
+
+// wakeMsg comes with the first key after ghdeck sat idle: refresh at once, and go back to the usual pace.
+type wakeMsg struct{}
 
 type refreshNowMsg struct{}
 
@@ -76,6 +79,7 @@ type model struct {
 	confirm *confirmation
 	help    bool
 	stack   []subview
+	tickGen int // which tick is current, so waking up does not leave a slow one running beside it
 
 	// openBranch opens the branch's pull request as soon as the first status says which it is.
 	openBranch bool
@@ -148,8 +152,9 @@ func (m model) refreshTab(tab int) tea.Cmd {
 	return load(kPRs, q, func() (any, error) { return fetchList(q) })
 }
 
-// tick refreshes every 30 seconds, every 10 while an Actions run on screen is moving, and every minute while the
-// hourly budget runs low. Nothing refreshes behind a full-screen view but the header; each view keeps its own time.
+// tick refreshes the list every 30 seconds, every 10 while an Actions run on screen is moving, and less often while
+// ghdeck sits idle or the hourly budget runs low (see pace). The header refreshes once a minute at most. Nothing
+// refreshes behind a full-screen view but the header; each view keeps its own time.
 func (m model) tick() tea.Cmd {
 	every := 30 * time.Second
 	if m.tab == tabRuns {
@@ -159,10 +164,8 @@ func (m model) tick() tea.Cmd {
 			}
 		}
 	}
-	if lowBudget() {
-		every = time.Minute
-	}
-	return tea.Tick(every, func(time.Time) tea.Msg { return tickMsg{} })
+	gen := m.tickGen
+	return tea.Tick(pace(every), func(time.Time) tea.Msg { return tickMsg{gen} })
 }
 
 func (m model) list(tab int) (List, *panel) {
@@ -221,7 +224,21 @@ func (m model) authExpired() bool {
 
 func (m *model) say(text string, isErr bool) { m.flash, m.isErr, m.flashAt = text, isErr, time.Now() }
 
+// Update notes each time someone uses ghdeck, and wakes it after a quiet spell.
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg.(type) {
+	case tea.KeyMsg, tea.MouseMsg:
+		woke := idle()
+		lastActive = time.Now()
+		if woke {
+			next, cmd := m.update(msg)
+			return next, tea.Batch(cmd, func() tea.Msg { return wakeMsg{} })
+		}
+	}
+	return m.update(msg)
+}
+
+func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case pushViewMsg:
 		m.stack = append(m.stack, msg.v)
@@ -258,10 +275,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
 	case tickMsg:
+		if msg.gen != m.tickGen {
+			return m, nil
+		}
 		m.branch = currentBranch(m.repo.Root)
-		cmds := []tea.Cmd{m.refreshStatus(), m.tick()}
+		cmds := []tea.Cmd{m.tick()}
+		// The header asks GraphQL too, so it keeps to a minute even while the list goes faster.
+		if p := m.panels[kStatus]; p == nil || !p.loading && time.Since(p.at) > pace(time.Minute)-5*time.Second {
+			cmds = append(cmds, m.refreshStatus())
+		}
 		if len(m.stack) == 0 {
 			cmds = append(cmds, m.refreshTab(m.tab))
+		}
+		return m, tea.Batch(cmds...)
+	case wakeMsg:
+		m.tickGen++
+		m.branch = currentBranch(m.repo.Root)
+		cmds := []tea.Cmd{m.refreshStatus(), m.tick()}
+		if n := len(m.stack); n == 0 {
+			cmds = append(cmds, m.refreshTab(m.tab))
+		} else if r, ok := m.stack[n-1].(refresher); ok {
+			cmds = append(cmds, r.Refresh())
 		}
 		return m, tea.Batch(cmds...)
 	case refreshNowMsg:
