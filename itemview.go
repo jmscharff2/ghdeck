@@ -154,6 +154,10 @@ func (v *itemView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 		if it.IsPR && v.d != nil && it.State == "OPEN" {
 			return true, pushView(v.mergePicker())
 		}
+	case "u":
+		if it.IsPR && v.d != nil && it.State == "OPEN" {
+			return true, pushView(v.updatePicker())
+		}
 	case "D":
 		if it.IsPR && v.d != nil && it.State == "OPEN" {
 			id, draft := v.d.ID, !it.Draft
@@ -243,6 +247,34 @@ func (v *itemView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 // after reports an action done and reloads this view.
 func (v *itemView) after(text string) tea.Cmd {
 	return tea.Batch(func() tea.Msg { return actionMsg{text: text} }, v.fetch())
+}
+
+// updatePicker brings the base branch's new commits into the pull request's branch, by merging or by rebasing.
+// Either pushes to the branch, so it asks first.
+func (v *itemView) updatePicker() *picker {
+	d := v.d
+	choice := func(label, detail string, rebase bool) option {
+		return option{label: label, detail: detail, run: func() tea.Cmd {
+			v.ask = newConfirmation(fmt.Sprintf("%s #%d's branch %s?", label, d.Number, d.Head), func() tea.Msg {
+				if err := updateBranch(d.ID, d.HeadSHA, rebase); err != nil {
+					return actionMsg{err: err}
+				}
+				return actionMsg{text: fmt.Sprintf("updating %s from %s · checks run again", d.Head, d.Base), refresh: true}
+			})
+			return nil
+		}}
+	}
+	p := newPicker(fmt.Sprintf("Update #%d with %s", d.Number, d.Base), []option{
+		choice("Merge "+d.Base+" into", "a merge commit on "+d.Head+"; history stays as it is", false),
+		choice("Rebase onto "+d.Base, "rewrites "+d.Head+"'s commits: anyone else's checkout of it will need a reset", true),
+	})
+	p.note = func(int) []string {
+		if d.MergeWhy == "BEHIND" {
+			return []string{" " + sWarn.Render(d.Head+" is behind "+d.Base) + sMuted.Render(", and the branch rules want it up to date to merge.")}
+		}
+		return []string{sMuted.Render(" " + d.Head + " gets " + d.Base + "'s latest commits.")}
+	}
+	return p
 }
 
 // mergePicker offers the merge methods the repository allows, the one you used last first, each with and without
@@ -466,7 +498,7 @@ func mergeLine(d *Detail) string {
 	case d.MergeWhy == "CLEAN" || d.MergeWhy == "HAS_HOOKS":
 		return sGood.Render("ready to merge")
 	case d.MergeWhy == "BEHIND":
-		return sWarn.Render("behind " + d.Base)
+		return sWarn.Render("behind " + d.Base + " · u updates it")
 	case d.MergeWhy == "BLOCKED":
 		return sWarn.Render("blocked by branch rules")
 	case d.MergeWhy == "UNSTABLE":
@@ -652,6 +684,9 @@ func (v *itemView) footer(w int) string {
 		keys = append(keys, [2]string{"d", "diff"}, [2]string{"v", "review"}, [2]string{"s", "checks"})
 		if it.State == "OPEN" {
 			keys = append(keys, [2]string{"m", "merge"}, [2]string{"R", "reviewers"}, [2]string{"D", "draft/ready"})
+			if v.d != nil && v.d.MergeWhy == "BEHIND" {
+				keys = append(keys, [2]string{"u", "update branch"})
+			}
 		}
 		keys = append(keys, [2]string{"C", "checkout"}, [2]string{"W", "worktree"})
 		if inHerdr() && it.State == "OPEN" {

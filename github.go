@@ -747,6 +747,18 @@ func deleteBranch(repo, branch string) error {
 	return ghWrite("DELETE", fmt.Sprintf("repos/%s/git/refs/heads/%s", repo, refPath(branch)), nil, nil)
 }
 
+// updateBranch brings the base branch's new commits into a pull request's branch, by a merge commit or by rebasing,
+// if its head is still sha: GitHub's "Update branch" button.
+func updateBranch(prID, sha string, rebase bool) error {
+	method := "MERGE"
+	if rebase {
+		method = "REBASE"
+	}
+	return ghQuery(`mutation($id: ID!, $sha: GitObjectID!, $m: PullRequestBranchUpdateMethod!) {
+		updatePullRequestBranch(input: {pullRequestId: $id, expectedHeadOid: $sha, updateMethod: $m}) { clientMutationId } }`,
+		map[string]any{"id": prID, "sha": sha, "m": method}, nil)
+}
+
 // setAutoMerge has a pull request merge itself, by method, once its checks and reviews allow, if its head is still
 // sha; or stops it.
 func setAutoMerge(prID, method, sha string, on bool) error {
