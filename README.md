@@ -1,0 +1,182 @@
+# ghdeck
+
+A terminal deck for the GitHub repository you are working in. It shows the repo's pull requests, issues and Actions
+runs, and opens with your branch's pull request one key away. You can review a diff line by line, draft comments
+and send them as one review, approve, merge, read a failed job's log, and check a pull request out into a worktree,
+all without leaving the terminal. Inside [Herdr](https://herdr.dev), any of it can be handed to a coding agent
+running in another pane.
+
+ghdeck uses the `gh` CLI's login. It stores no credentials and calls nothing but the GitHub API.
+
+```
+ghdeck  1 Pull requests 12  2 Issues 31  3 Actions
+ me/my-app · on fix-login → #482 ✓ approved · b · 2 awaiting your review
+ open · 12s ago
+▸ #482  ● Fix the login redirect loop             ✓✔ +48−12      💬3   me             2h
+  #479  ● Add rate limiting to the public API     ✗• +310−41     💬7   sam            5h
+  #477  ○ draft · Move settings to a new page     ◐  +902−655          lee            1d
+  #470  ● Bump the Go toolchain                   ✓• +3−3              renovate       3d
+ tab list · ↑↓ enter open · d diff · f filter · / search · a agent · ? more · q quit
+```
+
+## Install
+
+Needs Go 1.24+ and the [GitHub CLI](https://cli.github.com), signed in (`gh auth login`).
+
+```bash
+go install github.com/jmscharff2/ghdeck@latest
+```
+
+Run it anywhere inside a checkout. It finds the repository from the remote that `gh repo set-default` chose, else
+`origin`, else the first GitHub remote. `ghdeck -R owner/name` opens any repository, and `ghdeck -branch` opens
+straight onto the pull request for the checked-out branch.
+
+### As a Herdr plugin
+
+```bash
+herdr plugin install jmscharff2/ghdeck      # builds it with Go; needs Herdr 0.9.3 or later
+```
+
+This adds three actions to Herdr, each for the repository in the pane you are working in:
+
+- **ghdeck: open beside this pane**
+- **ghdeck: open in a new tab**
+- **ghdeck: review this branch's pull request**, which opens on your branch's PR
+
+To work on ghdeck itself, `herdr plugin link <path to your checkout>` uses your local build instead.
+
+To open it with a key, bind the action, or add a popup to Herdr's `config.toml` (with ghdeck on your `PATH`, from
+`go install`):
+
+```toml
+[[keys.command]]
+key = ["prefix+g"]
+type = "plugin_action"
+command = "ghdeck.open"
+
+[[keys.command]]
+key = ["prefix+P"]
+type = "popup"
+command = "cd \"${HERDR_ACTIVE_PANE_CWD:-.}\" && exec ghdeck -branch"
+description = "This branch's pull request"
+width = "95%"
+height = "90%"
+```
+
+Inside Herdr, ghdeck also:
+
+- **opens interactive commands in a pane below** (`gh pr create`, `gh issue create`, checking a branch out, signing
+  in). Outside Herdr they borrow the terminal until they exit.
+- **opens a pull request's worktree as a Herdr workspace** (`W`), checked out beside your checkout, so you can run it
+  or give it to an agent without touching your branch.
+- **hands work to an agent** (`a`): a pull request, an issue, failing checks or a failed run. It lists the agents
+  Herdr is running, the ones working in this repo first, and shows the prompt it will send, which `e` lets you edit
+  first. If no agent fits, it can start Claude Code in a new pane.
+- **sends notifications** when your branch's checks fail or pass, when it is approved or changes are requested, and
+  when someone asks for your review.
+
+## Screens
+
+**Lists.** Pull requests, issues and Actions runs, a tab each. `f` steps through preset filters. For pull requests
+they are open, review requested, mine and closed; for issues, open, assigned to me, mine and closed. `/` takes a
+GitHub search (`label:bug author:sam`, `is:merged`, `sort:created-asc`) in place of the preset. The header shows your
+branch's pull request with its checks and review state, and how many pull requests are waiting on your review.
+
+**A pull request.** Its merge state, a summary of its checks and reviewers, the description, the checks (failing
+ones first), unresolved review threads, and the conversation: comments, reviews, commits, merges.
+
+**The diff.** One file at a time, with each review thread under the line it is on and outdated threads at the top
+of their file. `c` drafts a comment on the line under the cursor. Drafts are saved as you write them (in
+`~/Library/Caches/ghdeck` on macOS, `~/.cache/ghdeck` on Linux), so closing the pane loses nothing. `v` sends every
+draft as one review, with a verdict and a summary.
+
+**A run.** Its jobs, with the chosen job's steps beneath it, live while it runs. `enter` streams the job's log with
+a header for each step.
+
+## Keys
+
+**Lists**
+
+| Key | Does |
+|---|---|
+| `tab` `shift+tab` `1`-`3` | pull requests, issues, Actions |
+| `↑` `↓` `enter` | choose and open |
+| `f` | next filter (Actions: all branches, or this one) |
+| `/` | search with GitHub's syntax; `esc` clears it |
+| `d` | the chosen pull request's diff |
+| `b` | your branch's pull request |
+| `n` | new pull request or issue (`gh pr create`, `gh issue create`) |
+| `C` | check the pull request out here (asks first, and warns about uncommitted changes) |
+| `W` | check it out in a worktree beside this checkout and, in Herdr, open that as a workspace |
+| `a` | hand the pull request or issue to an agent (Herdr) |
+| `o` | open on GitHub |
+| `A` | `gh auth login`, when the login has expired |
+| `r` `?` `q` | refresh, more keys, quit |
+
+**A pull request or issue**
+
+| Key | Does |
+|---|---|
+| `↑` `↓` `pgup` `pgdn` `g` `G` | scroll |
+| `c` | comment |
+| `d` `s` | the diff, every check (enter on an Actions check opens its run) |
+| `v` | review: comment, approve or request changes, with the diff's drafted line comments |
+| `m` | merge, by any method the repo allows, optionally deleting the branch (type `merge`) |
+| `D` | convert to draft, or mark ready for review |
+| `x` | close or reopen (type `yes`) |
+| `A` | assign yourself |
+| `C` `W` | check out here, or in a worktree |
+| `p` | an issue's linked pull request |
+| `a` `o` `r` | hand to an agent, open on GitHub, refresh |
+
+**The diff**
+
+| Key | Does |
+|---|---|
+| `↑` `↓` `pgup` `pgdn` `g` `G` | move the cursor line |
+| `n` `p` (or `]` `[`) | next, previous file |
+| `f` | every file, with its thread count |
+| `{` `}` | previous, next hunk |
+| `t` `T` | next, previous line with a thread or a draft, across files |
+| `c` | draft a comment on this line |
+| `e` `x` | edit, delete your draft on this line |
+| `R` | reply to the thread on this line (posts at once) |
+| `v` | send the review |
+| `w` | wrap long lines on or off |
+| `o` | the files on GitHub |
+
+**Writing.** `ctrl+s` sends, `ctrl+e` finishes the text in `$EDITOR`, and `esc` twice throws it away.
+
+## How it uses GitHub
+
+Lists and pull request screens each come from one GraphQL query. Diffs, review comments and Actions come from the
+REST API, asked for again with the last response's ETag. GitHub answers 304 when nothing changed, and a 304 does not
+count against the hourly limit. Lists refresh every 30 seconds (every 10 while an Actions run on screen is moving),
+and a pull request's screen every minute, or every 15 seconds while its checks run. When either hourly budget runs
+low, everything slows to once a minute or two. When a limit is reached, ghdeck stops asking until the reset time it
+shows. `GH_HOST` points it at GitHub Enterprise.
+
+## Security
+
+- **Text from GitHub is cleaned before it reaches your terminal.** Anyone who can open an issue writes text ghdeck
+  shows: titles, descriptions, comments, diffs, branch names, logs. Escape sequences and control characters are
+  removed, so a comment cannot set your clipboard or redraw your screen.
+- **Agents get references, not text.** A prompt names the pull request or issue and points the agent at `gh` to read
+  it. It never pastes in the description or comments, which a stranger may have written to steer an agent. You see
+  the prompt before it is sent.
+- **Changes ask for a typed word**: `merge` to merge, `yes` to close, reopen, check out or re-run. A single key never
+  confirms, and pasted text does not count. A merge is sent with the head commit you reviewed, so GitHub refuses it
+  if someone pushed since.
+- **Only `https` links open in the browser.**
+- **ghdeck stores no credentials.** It uses `gh auth token`, and sends the token only to the API host.
+
+What it does not protect against: anything that already runs as you. A program that can type into the ghdeck pane
+(Herdr lets agents send keys) can type a confirmation word too; the typed word stops slips, not a determined program.
+
+## Development
+
+```bash
+go test ./...
+GHDECK_LIVE=1 go test -run TestLive .    # reads a public repo through the real API
+go build -o ghdeck . && ./ghdeck -R owner/name
+```

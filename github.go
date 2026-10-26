@@ -1,0 +1,746 @@
+package main
+
+import (
+	"fmt"
+	"net/url"
+	"sort"
+	"strings"
+	"time"
+)
+
+// Item is a pull request or an issue as a list shows it.
+type Item struct {
+	Number    int
+	Title     string
+	State     string // OPEN, CLOSED, MERGED
+	Author    string
+	URL       string
+	IsPR      bool
+	Draft     bool
+	Updated   time.Time
+	Comments  int
+	Labels    []string
+	Assignees []string
+
+	// Pull requests only.
+	Head, Base string
+	Review     string // reviewDecision: APPROVED, CHANGES_REQUESTED, REVIEW_REQUIRED, or ""
+	Checks     string // the head commit's rollup: SUCCESS, FAILURE, ERROR, PENDING, EXPECTED, or ""
+	Additions  int
+	Deletions  int
+}
+
+// GraphQL shapes shared by the queries below.
+type gqlLogin struct {
+	Login string `json:"login"`
+}
+
+type gqlNames struct {
+	Nodes []struct {
+		Name  string `json:"name"`
+		Login string `json:"login"`
+	} `json:"nodes"`
+}
+
+func (n gqlNames) list() []string {
+	var out []string
+	for _, x := range n.Nodes {
+		out = append(out, clean(or(x.Name, x.Login)))
+	}
+	return out
+}
+
+type gqlItem struct {
+	Typename   string    `json:"__typename"`
+	Number     int       `json:"number"`
+	Title      string    `json:"title"`
+	State      string    `json:"state"`
+	URL        string    `json:"url"`
+	UpdatedAt  time.Time `json:"updatedAt"`
+	Author     *gqlLogin `json:"author"`
+	IsDraft    bool      `json:"isDraft"`
+	HeadRef    string    `json:"headRefName"`
+	BaseRef    string    `json:"baseRefName"`
+	Review     string    `json:"reviewDecision"`
+	Additions  int       `json:"additions"`
+	Deletions  int       `json:"deletions"`
+	Labels     gqlNames  `json:"labels"`
+	Assignees  gqlNames  `json:"assignees"`
+	CommentsCt struct {
+		Total int `json:"totalCount"`
+	} `json:"comments"`
+	Commits struct {
+		Nodes []struct {
+			Commit struct {
+				Rollup *struct {
+					State string `json:"state"`
+				} `json:"statusCheckRollup"`
+			} `json:"commit"`
+		} `json:"nodes"`
+	} `json:"commits"`
+}
+
+const prFields = `
+		number title state url updatedAt isDraft headRefName baseRefName reviewDecision additions deletions
+		author { login }
+		comments { totalCount }
+		labels(first: 6) { nodes { name } }
+		assignees(first: 4) { nodes { login } }
+		commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }`
+
+const itemFields = `
+	__typename
+	... on PullRequest {` + prFields + `
+	}
+	... on Issue {
+		number title state url updatedAt
+		author { login }
+		comments { totalCount }
+		labels(first: 6) { nodes { name } }
+		assignees(first: 4) { nodes { login } }
+	}`
+
+func (g gqlItem) item() Item {
+	it := Item{
+		Number: g.Number, Title: clean(g.Title), State: clean(g.State), URL: clean(g.URL), Updated: g.UpdatedAt,
+		IsPR: g.Typename == "PullRequest", Draft: g.IsDraft, Comments: g.CommentsCt.Total,
+		Labels: g.Labels.list(), Assignees: g.Assignees.list(),
+		Head: clean(g.HeadRef), Base: clean(g.BaseRef), Review: clean(g.Review), Additions: g.Additions, Deletions: g.Deletions,
+	}
+	if g.Author != nil {
+		it.Author = clean(g.Author.Login)
+	} else {
+		it.Author = "ghost"
+	}
+	if n := g.Commits.Nodes; len(n) > 0 && n[0].Commit.Rollup != nil {
+		it.Checks = clean(n[0].Commit.Rollup.State)
+	}
+	return it
+}
+
+// filter is one of a list's preset searches.
+type filter struct {
+	name  string
+	query string // added to "repo:owner/name is:pr" or "is:issue"
+}
+
+var prFilters = []filter{
+	{"open", "is:open"},
+	{"review requested", "is:open review-requested:@me"},
+	{"mine", "is:open author:@me"},
+	{"closed", "is:closed"},
+}
+
+var issueFilters = []filter{
+	{"open", "is:open"},
+	{"assigned to me", "is:open assignee:@me"},
+	{"mine", "is:open author:@me"},
+	{"closed", "is:closed"},
+}
+
+// searchQuery builds a GitHub search for a list. extra is what you typed after /, in GitHub's search syntax.
+func searchQuery(repo string, prs bool, f filter, extra string) string {
+	kind := "is:issue"
+	if prs {
+		kind = "is:pr"
+	}
+	q := "repo:" + repo + " " + kind + " "
+	if extra != "" {
+		q += extra
+	} else {
+		q += f.query
+	}
+	if !strings.Contains(q, "sort:") {
+		q += " sort:updated-desc"
+	}
+	return q
+}
+
+// List is one page of search results.
+type List struct {
+	Items []Item
+	Total int
+}
+
+func fetchList(query string) (List, error) {
+	var resp struct {
+		Search struct {
+			Count int       `json:"issueCount"`
+			Nodes []gqlItem `json:"nodes"`
+		} `json:"search"`
+	}
+	err := ghQuery(`query($q: String!) { search(query: $q, type: ISSUE, first: 50) { issueCount nodes {`+itemFields+`} } }`,
+		map[string]any{"q": query}, &resp)
+	if err != nil {
+		return List{}, err
+	}
+	l := List{Total: resp.Search.Count}
+	for _, n := range resp.Search.Nodes {
+		if n.Number != 0 {
+			l.Items = append(l.Items, n.item())
+		}
+	}
+	return l, nil
+}
+
+// Status is what the header shows whatever tab is open: your branch's pull request and what waits on your review.
+type Status struct {
+	Viewer    string
+	BranchPR  *Item
+	ReviewFor []Item // open pull requests asking for your review
+}
+
+func fetchStatus(repo, branch string) (Status, error) {
+	owner, name, _ := strings.Cut(repo, "/")
+	q := `query($o: String!, $n: String!, $b: String!, $rq: String!, $hasBranch: Boolean!) {
+		viewer { login }
+		repository(owner: $o, name: $n) {
+			pullRequests(headRefName: $b, first: 1, states: [OPEN], orderBy: {field: UPDATED_AT, direction: DESC}) @include(if: $hasBranch) {
+				nodes { __typename ` + prFields + ` }
+			}
+		}
+		review: search(query: $rq, type: ISSUE, first: 20) { nodes {` + itemFields + `} }
+	}`
+	var resp struct {
+		Viewer     gqlLogin `json:"viewer"`
+		Repository *struct {
+			PRs *struct {
+				Nodes []gqlItem `json:"nodes"`
+			} `json:"pullRequests"`
+		} `json:"repository"`
+		Review struct {
+			Nodes []gqlItem `json:"nodes"`
+		} `json:"review"`
+	}
+	err := ghQuery(q, map[string]any{
+		"o": owner, "n": name, "b": branch, "hasBranch": branch != "",
+		"rq": "repo:" + repo + " is:pr is:open review-requested:@me",
+	}, &resp)
+	if err != nil {
+		return Status{}, err
+	}
+	s := Status{Viewer: clean(resp.Viewer.Login)}
+	if r := resp.Repository; r != nil && r.PRs != nil && len(r.PRs.Nodes) > 0 {
+		it := r.PRs.Nodes[0].item()
+		s.BranchPR = &it
+	}
+	for _, n := range resp.Review.Nodes {
+		if n.Number != 0 {
+			s.ReviewFor = append(s.ReviewFor, n.item())
+		}
+	}
+	return s, nil
+}
+
+// ---- one pull request or issue in full ----
+
+// Event is one entry in a conversation: a comment, a review, a commit, a state change.
+type Event struct {
+	Kind   string // comment, review, commit, merged, closed, reopened
+	Author string
+	Body   string
+	State  string // a review's: APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED
+	At     time.Time
+	Extra  string // a commit's short SHA, a review's comment count
+}
+
+// Check is one status check on a pull request's head commit.
+type Check struct {
+	Name       string
+	Status     string // QUEUED, IN_PROGRESS, COMPLETED, … or a status context's state
+	Conclusion string // SUCCESS, FAILURE, …
+	URL        string
+	RunID      int64 // the Actions run behind a check run, when there is one
+}
+
+// Thread is a review thread on a pull request's diff.
+type Thread struct {
+	Path     string
+	Line     int
+	Resolved bool
+	Outdated bool
+	Comments []Event
+}
+
+// Detail is a pull request or issue with everything its screen shows.
+type Detail struct {
+	Item
+	ID        string // GraphQL node id, for mutations
+	Body      string
+	Created   time.Time
+	HeadSHA   string
+	Changed   int
+	Mergeable string // MERGEABLE, CONFLICTING, UNKNOWN
+	MergeWhy  string // mergeStateStatus: BLOCKED, BEHIND, CLEAN, DIRTY, UNSTABLE, …
+	Fork      bool   // the head branch lives in another repository
+	Reviewers []string
+	Reviews   []Event // the latest review from each reviewer
+	Checks    []Check
+	Threads   []Thread
+	Events    []Event
+	Linked    []Item // pull requests that will close this issue
+	Methods   []string
+}
+
+const detailQuery = `query($o: String!, $n: String!, $num: Int!) {
+	repository(owner: $o, name: $n) {
+		squashMergeAllowed mergeCommitAllowed rebaseMergeAllowed viewerDefaultMergeMethod
+		issueOrPullRequest(number: $num) {
+			__typename
+			... on PullRequest {
+				id number title state url body createdAt updatedAt isDraft headRefName baseRefName headRefOid
+				reviewDecision additions deletions changedFiles mergeable mergeStateStatus isCrossRepository
+				author { login }
+				comments { totalCount }
+				labels(first: 20) { nodes { name } }
+				assignees(first: 10) { nodes { login } }
+				reviewRequests(first: 10) { nodes { requestedReviewer { ... on User { login } ... on Team { name } } } }
+				latestReviews(first: 20) { nodes { author { login } state submittedAt } }
+				commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { nodes {
+					__typename
+					... on CheckRun { name status conclusion detailsUrl checkSuite { workflowRun { databaseId } } }
+					... on StatusContext { context state targetUrl }
+				} } } } } }
+				reviewThreads(first: 100) { nodes { isResolved isOutdated path line originalLine
+					comments(first: 30) { nodes { author { login } body createdAt } } } }
+				timelineItems(last: 60, itemTypes: [ISSUE_COMMENT, PULL_REQUEST_REVIEW, PULL_REQUEST_COMMIT, MERGED_EVENT, CLOSED_EVENT, REOPENED_EVENT]) {
+					nodes {
+						__typename
+						... on IssueComment { author { login } body createdAt }
+						... on PullRequestReview { author { login } body state submittedAt comments { totalCount } }
+						... on PullRequestCommit { commit { oid messageHeadline committedDate author { user { login } name } } }
+						... on MergedEvent { actor { login } createdAt }
+						... on ClosedEvent { actor { login } createdAt }
+						... on ReopenedEvent { actor { login } createdAt }
+					}
+				}
+			}
+			... on Issue {
+				id number title state url body createdAt updatedAt
+				author { login }
+				comments { totalCount }
+				labels(first: 20) { nodes { name } }
+				assignees(first: 10) { nodes { login } }
+				closedByPullRequestsReferences(first: 5) { nodes { number title state url } }
+				timelineItems(last: 60, itemTypes: [ISSUE_COMMENT, CLOSED_EVENT, REOPENED_EVENT]) {
+					nodes {
+						__typename
+						... on IssueComment { author { login } body createdAt }
+						... on ClosedEvent { actor { login } createdAt }
+						... on ReopenedEvent { actor { login } createdAt }
+					}
+				}
+			}
+		}
+	}
+}`
+
+type gqlEvent struct {
+	Typename    string    `json:"__typename"`
+	Author      *gqlLogin `json:"author"`
+	Actor       *gqlLogin `json:"actor"`
+	Body        string    `json:"body"`
+	State       string    `json:"state"`
+	CreatedAt   time.Time `json:"createdAt"`
+	SubmittedAt time.Time `json:"submittedAt"`
+	Comments    struct {
+		Total int `json:"totalCount"`
+	} `json:"comments"`
+	Commit struct {
+		OID      string    `json:"oid"`
+		Headline string    `json:"messageHeadline"`
+		Date     time.Time `json:"committedDate"`
+		Author   struct {
+			User *gqlLogin `json:"user"`
+			Name string    `json:"name"`
+		} `json:"author"`
+	} `json:"commit"`
+}
+
+func login(l *gqlLogin) string {
+	if l == nil {
+		return "ghost"
+	}
+	return clean(l.Login)
+}
+
+func (g gqlEvent) event() (Event, bool) {
+	switch g.Typename {
+	case "IssueComment":
+		return Event{Kind: "comment", Author: login(g.Author), Body: cleanBody(g.Body), At: g.CreatedAt}, true
+	case "PullRequestReview":
+		// A review with no summary and only line comments is shown by its threads; keep it for its verdict.
+		e := Event{Kind: "review", Author: login(g.Author), Body: cleanBody(g.Body), State: clean(g.State), At: g.SubmittedAt}
+		if g.Comments.Total > 0 {
+			e.Extra = fmt.Sprintf("%d line comment(s)", g.Comments.Total)
+		}
+		return e, true
+	case "PullRequestCommit":
+		who := clean(g.Commit.Author.Name)
+		if g.Commit.Author.User != nil {
+			who = clean(g.Commit.Author.User.Login)
+		}
+		return Event{Kind: "commit", Author: who, Body: clean(g.Commit.Headline), At: g.Commit.Date, Extra: short(clean(g.Commit.OID))}, true
+	case "MergedEvent":
+		return Event{Kind: "merged", Author: login(g.Actor), At: g.CreatedAt}, true
+	case "ClosedEvent":
+		return Event{Kind: "closed", Author: login(g.Actor), At: g.CreatedAt}, true
+	case "ReopenedEvent":
+		return Event{Kind: "reopened", Author: login(g.Actor), At: g.CreatedAt}, true
+	}
+	return Event{}, false
+}
+
+// cleanBody cleans a description or comment, keeping its lines.
+func cleanBody(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		lines[i] = clean(l)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func fetchDetail(repo string, number int) (*Detail, error) {
+	owner, name, _ := strings.Cut(repo, "/")
+	var resp struct {
+		Repository *struct {
+			Squash  bool   `json:"squashMergeAllowed"`
+			Merge   bool   `json:"mergeCommitAllowed"`
+			Rebase  bool   `json:"rebaseMergeAllowed"`
+			Default string `json:"viewerDefaultMergeMethod"`
+			Node    *struct {
+				gqlItem
+				ID         string    `json:"id"`
+				Body       string    `json:"body"`
+				CreatedAt  time.Time `json:"createdAt"`
+				HeadOID    string    `json:"headRefOid"`
+				Changed    int       `json:"changedFiles"`
+				Mergeable  string    `json:"mergeable"`
+				MergeState string    `json:"mergeStateStatus"`
+				CrossRepo  bool      `json:"isCrossRepository"`
+				ReviewReqs struct {
+					Nodes []struct {
+						Reviewer *struct {
+							Login string `json:"login"`
+							Name  string `json:"name"`
+						} `json:"requestedReviewer"`
+					} `json:"nodes"`
+				} `json:"reviewRequests"`
+				Latest struct {
+					Nodes []gqlEvent `json:"nodes"`
+				} `json:"latestReviews"`
+				Commits2 struct {
+					Nodes []struct {
+						Commit struct {
+							Rollup *struct {
+								State    string `json:"state"`
+								Contexts struct {
+									Nodes []struct {
+										Typename   string `json:"__typename"`
+										Name       string `json:"name"`
+										Status     string `json:"status"`
+										Conclusion string `json:"conclusion"`
+										DetailsURL string `json:"detailsUrl"`
+										Suite      *struct {
+											Run *struct {
+												ID int64 `json:"databaseId"`
+											} `json:"workflowRun"`
+										} `json:"checkSuite"`
+										Context   string `json:"context"`
+										State     string `json:"state"`
+										TargetURL string `json:"targetUrl"`
+									} `json:"nodes"`
+								} `json:"contexts"`
+							} `json:"statusCheckRollup"`
+						} `json:"commit"`
+					} `json:"nodes"`
+				} `json:"commits"`
+				Threads struct {
+					Nodes []struct {
+						Resolved     bool   `json:"isResolved"`
+						Outdated     bool   `json:"isOutdated"`
+						Path         string `json:"path"`
+						Line         int    `json:"line"`
+						OriginalLine int    `json:"originalLine"`
+						Comments     struct {
+							Nodes []gqlEvent `json:"nodes"`
+						} `json:"comments"`
+					} `json:"nodes"`
+				} `json:"reviewThreads"`
+				Timeline struct {
+					Nodes []gqlEvent `json:"nodes"`
+				} `json:"timelineItems"`
+				Closers struct {
+					Nodes []gqlItem `json:"nodes"`
+				} `json:"closedByPullRequestsReferences"`
+			} `json:"issueOrPullRequest"`
+		} `json:"repository"`
+	}
+	if err := ghQuery(detailQuery, map[string]any{"o": owner, "n": name, "num": number}, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Repository == nil || resp.Repository.Node == nil {
+		return nil, fmt.Errorf("#%d not found in %s", number, repo)
+	}
+	n := resp.Repository.Node
+	d := &Detail{
+		Item: n.item(), ID: n.ID, Body: cleanBody(n.Body), Created: n.CreatedAt, HeadSHA: clean(n.HeadOID),
+		Changed: n.Changed, Mergeable: clean(n.Mergeable), MergeWhy: clean(n.MergeState), Fork: n.CrossRepo,
+	}
+	for _, r := range n.ReviewReqs.Nodes {
+		if r.Reviewer != nil {
+			d.Reviewers = append(d.Reviewers, clean(or(r.Reviewer.Login, r.Reviewer.Name)))
+		}
+	}
+	for _, r := range n.Latest.Nodes {
+		d.Reviews = append(d.Reviews, Event{Kind: "review", Author: login(r.Author), State: clean(r.State), At: r.SubmittedAt})
+	}
+	// Commits2 shadows the list fields' commits, so the rollup state is read from it.
+	for _, c := range n.Commits2.Nodes {
+		if c.Commit.Rollup == nil {
+			continue
+		}
+		d.Item.Checks = clean(c.Commit.Rollup.State)
+		for _, x := range c.Commit.Rollup.Contexts.Nodes {
+			ch := Check{Name: clean(x.Name), Status: clean(x.Status), Conclusion: clean(x.Conclusion), URL: clean(x.DetailsURL)}
+			if x.Typename == "StatusContext" {
+				ch = Check{Name: clean(x.Context), Status: "COMPLETED", Conclusion: clean(x.State), URL: clean(x.TargetURL)}
+				if x.State == "PENDING" || x.State == "EXPECTED" {
+					ch.Status, ch.Conclusion = "IN_PROGRESS", ""
+				}
+			}
+			if x.Suite != nil && x.Suite.Run != nil {
+				ch.RunID = x.Suite.Run.ID
+			}
+			d.Checks = append(d.Checks, ch)
+		}
+	}
+	sort.SliceStable(d.Checks, func(i, j int) bool { return checkRank(d.Checks[i]) < checkRank(d.Checks[j]) })
+	for _, t := range n.Threads.Nodes {
+		th := Thread{Path: clean(t.Path), Line: or0(t.Line, t.OriginalLine), Resolved: t.Resolved, Outdated: t.Outdated}
+		for _, c := range t.Comments.Nodes {
+			th.Comments = append(th.Comments, Event{Kind: "comment", Author: login(c.Author), Body: cleanBody(c.Body), At: c.CreatedAt})
+		}
+		d.Threads = append(d.Threads, th)
+	}
+	for _, e := range n.Timeline.Nodes {
+		if ev, ok := e.event(); ok {
+			d.Events = append(d.Events, ev)
+		}
+	}
+	for _, c := range n.Closers.Nodes {
+		d.Linked = append(d.Linked, Item{Number: c.Number, Title: clean(c.Title), State: clean(c.State), URL: clean(c.URL), IsPR: true})
+	}
+	r := resp.Repository
+	def := strings.ToLower(clean(r.Default))
+	for _, m := range []struct {
+		name string
+		ok   bool
+	}{{"squash", r.Squash}, {"merge", r.Merge}, {"rebase", r.Rebase}} {
+		if !m.ok {
+			continue
+		}
+		if m.name == def {
+			d.Methods = append([]string{m.name}, d.Methods...)
+		} else {
+			d.Methods = append(d.Methods, m.name)
+		}
+	}
+	return d, nil
+}
+
+func or0(a, b int) int {
+	if a != 0 {
+		return a
+	}
+	return b
+}
+
+// checkRank puts failing checks first, then running ones, then the rest.
+func checkRank(c Check) int {
+	switch {
+	case c.Status != "COMPLETED":
+		return 1
+	case c.Conclusion == "FAILURE" || c.Conclusion == "ERROR" || c.Conclusion == "TIMED_OUT" ||
+		c.Conclusion == "ACTION_REQUIRED" || c.Conclusion == "STARTUP_FAILURE" || c.Conclusion == "CANCELLED":
+		return 0
+	}
+	return 2
+}
+
+// ---- the diff ----
+
+// File is one changed file of a pull request, with its patch.
+type File struct {
+	Path      string `json:"filename"`
+	Previous  string `json:"previous_filename"`
+	Status    string `json:"status"` // added, removed, modified, renamed, …
+	Additions int    `json:"additions"`
+	Deletions int    `json:"deletions"`
+	Patch     string `json:"patch"`
+}
+
+// fetchFiles reads every changed file, a hundred to a page. GitHub lists at most 3000.
+func fetchFiles(repo string, number int) ([]File, error) {
+	var all []File
+	for page := 1; page <= 30; page++ {
+		var files []File
+		if err := ghGet(fmt.Sprintf("repos/%s/pulls/%d/files?per_page=100&page=%d", repo, number, page), &files); err != nil {
+			return all, err
+		}
+		for i := range files {
+			f := &files[i]
+			f.Path, f.Previous, f.Status, f.Patch = clean(f.Path), clean(f.Previous), clean(f.Status), cleanKeepTabsLines(f.Patch)
+		}
+		all = append(all, files...)
+		if len(files) < 100 {
+			break
+		}
+	}
+	return all, nil
+}
+
+// cleanKeepTabsLines cleans a patch line by line, keeping its newlines and tabs.
+func cleanKeepTabsLines(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		lines[i] = cleanKeepTabs(l)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// ReviewComment is a comment on a line of the diff, from REST, which gives the ids replies need.
+type ReviewComment struct {
+	ID        int64     `json:"id"`
+	ReplyTo   int64     `json:"in_reply_to_id"`
+	Path      string    `json:"path"`
+	Line      int       `json:"line"`
+	Side      string    `json:"side"`
+	Original  int       `json:"original_line"`
+	Body      string    `json:"body"`
+	Created   time.Time `json:"created_at"`
+	User      gqlLogin  `json:"user"`
+	CommitID  string    `json:"commit_id"`
+	Outdated  bool      `json:"-"`
+	Pending   bool      `json:"-"` // a draft of yours, not yet sent
+	DraftSide string    `json:"-"`
+}
+
+func fetchReviewComments(repo string, number int) ([]ReviewComment, error) {
+	var all []ReviewComment
+	for page := 1; page <= 10; page++ {
+		var cs []ReviewComment
+		if err := ghGet(fmt.Sprintf("repos/%s/pulls/%d/comments?per_page=100&page=%d", repo, number, page), &cs); err != nil {
+			return all, err
+		}
+		for i := range cs {
+			c := &cs[i]
+			c.Path, c.Side, c.Body, c.User.Login = clean(c.Path), clean(c.Side), cleanBody(c.Body), clean(c.User.Login)
+			// GitHub drops line when the code it was on has changed since.
+			c.Outdated = c.Line == 0
+		}
+		all = append(all, cs...)
+		if len(cs) < 100 {
+			break
+		}
+	}
+	return all, nil
+}
+
+// ---- writes ----
+
+func postComment(repo string, number int, body string) error {
+	return ghWrite("POST", fmt.Sprintf("repos/%s/issues/%d/comments", repo, number), map[string]string{"body": body}, nil)
+}
+
+func replyToComment(repo string, number int, id int64, body string) error {
+	gh.forget(fmt.Sprintf("repos/%s/pulls/%d/comments", repo, number))
+	return ghWrite("POST", fmt.Sprintf("repos/%s/pulls/%d/comments/%d/replies", repo, number, id), map[string]string{"body": body}, nil)
+}
+
+// DraftComment is a line comment kept until the review it belongs to is submitted.
+type DraftComment struct {
+	Path string `json:"path"`
+	Line int    `json:"line"`
+	Side string `json:"side"` // RIGHT for the new code, LEFT for removed lines
+	Body string `json:"body"`
+}
+
+// submitReview sends a review in one request: its verdict, its summary and every line comment drafted for it.
+func submitReview(repo string, number int, sha, event, body string, comments []DraftComment) error {
+	payload := map[string]any{"event": event, "commit_id": sha}
+	if body != "" {
+		payload["body"] = body
+	}
+	if len(comments) > 0 {
+		payload["comments"] = comments
+	}
+	gh.forget(fmt.Sprintf("repos/%s/pulls/%d/comments", repo, number))
+	return ghWrite("POST", fmt.Sprintf("repos/%s/pulls/%d/reviews", repo, number), payload, nil)
+}
+
+func setState(repo string, number int, isPR bool, state string) error {
+	kind := "issues"
+	if isPR {
+		kind = "pulls"
+	}
+	return ghWrite("PATCH", fmt.Sprintf("repos/%s/%s/%d", repo, kind, number), map[string]string{"state": state}, nil)
+}
+
+func mergePR(repo string, number int, sha, method string) error {
+	return ghWrite("PUT", fmt.Sprintf("repos/%s/pulls/%d/merge", repo, number),
+		map[string]string{"merge_method": method, "sha": sha}, nil)
+}
+
+func deleteBranch(repo, branch string) error {
+	return ghWrite("DELETE", fmt.Sprintf("repos/%s/git/refs/heads/%s", repo, url.PathEscape(branch)), nil, nil)
+}
+
+func assign(repo string, number int, who string) error {
+	return ghWrite("POST", fmt.Sprintf("repos/%s/issues/%d/assignees", repo, number), map[string][]string{"assignees": {who}}, nil)
+}
+
+// setDraft turns a pull request into a draft, or marks a draft ready for review.
+func setDraft(id string, draft bool) error {
+	m := `mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { clientMutationId } }`
+	if draft {
+		m = `mutation($id: ID!) { convertPullRequestToDraft(input: {pullRequestId: $id}) { clientMutationId } }`
+	}
+	var out struct{}
+	return ghQuery(m, map[string]any{"id": id}, &out)
+}
+
+// ---- Actions ----
+
+type Run struct {
+	ID         int64     `json:"id"`
+	Name       string    `json:"name"`
+	Status     string    `json:"status"`
+	Conclusion string    `json:"conclusion"`
+	Branch     string    `json:"head_branch"`
+	SHA        string    `json:"head_sha"`
+	Event      string    `json:"event"`
+	Title      string    `json:"display_title"`
+	Created    time.Time `json:"created_at"`
+	Updated    time.Time `json:"updated_at"`
+	URL        string    `json:"html_url"`
+	Actor      gqlLogin  `json:"actor"`
+}
+
+func fetchRuns(repo, branch string) ([]Run, error) {
+	path := fmt.Sprintf("repos/%s/actions/runs?per_page=40", repo)
+	if branch != "" {
+		path += "&branch=" + url.QueryEscape(branch)
+	}
+	var resp struct {
+		Runs []Run `json:"workflow_runs"`
+	}
+	err := ghGet(path, &resp)
+	for i := range resp.Runs {
+		r := &resp.Runs[i]
+		r.Name, r.Status, r.Conclusion, r.Branch = clean(r.Name), clean(r.Status), clean(r.Conclusion), clean(r.Branch)
+		r.SHA, r.Event, r.Title, r.URL, r.Actor.Login = clean(r.SHA), clean(r.Event), clean(r.Title), clean(r.URL), clean(r.Actor.Login)
+	}
+	return resp.Runs, err
+}

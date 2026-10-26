@@ -1,0 +1,50 @@
+# ghdeck as a Herdr plugin: `herdr plugin install jmscharff2/ghdeck` builds it and adds actions that open the deck for
+# the repository in the pane you are working in.
+
+id = "ghdeck"
+name = "ghdeck"
+version = "0.1.0"
+# Plugin panes and actions, as tested; older releases may lack them.
+min_herdr_version = "0.9.3"
+description = "Pull requests, issues and Actions for the repo you are in: review diffs, comment, merge, and hand work to an agent"
+# It stops a command by signalling its process group, which Windows does not have.
+platforms = ["linux", "macos"]
+
+# Built at install time; Go is the only requirement.
+[[build]]
+command = ["go", "build", "-o", "ghdeck", "."]
+
+# The deck itself. It runs in the directory it is opened with (see the actions), so it finds that checkout's repo.
+[[panes]]
+id = "deck"
+title = "ghdeck"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/ghdeck\""]
+placement = "split"
+
+# The same, opened on the pull request for the checked-out branch.
+[[panes]]
+id = "branch"
+title = "ghdeck"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/ghdeck\" -branch"]
+placement = "split"
+
+[[actions]]
+id = "open"
+title = "ghdeck: open beside this pane"
+description = "Open ghdeck in a split, for the repository in the active pane"
+contexts = ["global", "pane"]
+command = ["sh", "-c", "exec \"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin ghdeck --entrypoint deck --placement split --direction right --cwd \"${HERDR_ACTIVE_PANE_CWD:-$HOME}\" --focus"]
+
+[[actions]]
+id = "open-tab"
+title = "ghdeck: open in a new tab"
+description = "Open ghdeck in its own tab, for the repository in the active pane"
+contexts = ["global", "pane"]
+command = ["sh", "-c", "exec \"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin ghdeck --entrypoint deck --placement tab --cwd \"${HERDR_ACTIVE_PANE_CWD:-$HOME}\" --focus"]
+
+[[actions]]
+id = "branch-pr"
+title = "ghdeck: review this branch's pull request"
+description = "Open the pull request for the branch checked out in the active pane"
+contexts = ["global", "pane"]
+command = ["sh", "-c", "exec \"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin ghdeck --entrypoint branch --placement split --direction right --cwd \"${HERDR_ACTIVE_PANE_CWD:-$HOME}\" --focus"]
