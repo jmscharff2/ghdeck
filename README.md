@@ -50,17 +50,17 @@ To open it with a key, bind the action, or add a popup to Herdr's `config.toml` 
 
 ```toml
 [[keys.command]]
-key = ["prefix+g"]
-type = "plugin_action"
-command = "ghdeck.open"
+key = ["cmd+shift+h", "prefix+h"]
+type = "popup"
+command = "cd \"${HERDR_ACTIVE_PANE_CWD:-.}\" && exec ghdeck"
+description = "GitHub deck"
+width = "95%"
+height = "90%"
 
 [[keys.command]]
 key = ["prefix+P"]
-type = "popup"
-command = "cd \"${HERDR_ACTIVE_PANE_CWD:-.}\" && exec ghdeck -branch"
-description = "This branch's pull request"
-width = "95%"
-height = "90%"
+type = "plugin_action"
+command = "ghdeck.open"
 ```
 
 Inside Herdr, ghdeck also:
