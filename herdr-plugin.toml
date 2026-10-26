@@ -48,3 +48,24 @@ title = "ghdeck: review this branch's pull request"
 description = "Open the pull request for the branch checked out in the active pane"
 contexts = ["global", "pane"]
 command = ["sh", "-c", "exec \"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin ghdeck --entrypoint branch --placement split --direction right --cwd \"${HERDR_ACTIVE_PANE_CWD:-$HOME}\" --focus"]
+
+# A GitHub link in any pane opens in ghdeck: ctrl+click a pull request, issue or Actions run. The deck opens over the
+# pane you clicked in, and q puts you back.
+[[panes]]
+id = "link"
+title = "ghdeck"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/ghdeck\" -open \"$GHDECK_OPEN\""]
+placement = "overlay"
+
+[[actions]]
+id = "open-link"
+title = "ghdeck: open this GitHub link"
+description = "Open a GitHub pull request, issue or run link in ghdeck"
+contexts = ["pane"]
+command = ["sh", "-c", "exec \"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin ghdeck --entrypoint link --placement overlay --cwd \"${HERDR_ACTIVE_PANE_CWD:-$HOME}\" --env \"GHDECK_OPEN=$HERDR_PLUGIN_CLICKED_URL\" --focus"]
+
+[[link_handlers]]
+id = "github"
+title = "Open in ghdeck"
+pattern = "^https://github\\.com/[^/]+/[^/]+/(pull/[0-9]+(/files)?|issues/[0-9]+|actions/runs/[0-9]+)([/?#].*)?$"
+action = "open-link"

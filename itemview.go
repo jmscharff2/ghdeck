@@ -129,6 +129,7 @@ func (v *itemView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 	case "G", "end":
 		v.scroll = 1 << 30
 	case "r":
+		sharedRefresh()
 		return true, v.fetch()
 	case "o":
 		return true, openURL(it.URL)
@@ -181,6 +182,14 @@ func (v *itemView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 			}
 			return actionMsg{text: fmt.Sprintf("#%d %s", it.Number, map[string]string{"closed": "closed", "open": "reopened"}[state]), refresh: true}
 		})
+	case "R":
+		if it.IsPR && v.d != nil && it.State == "OPEN" {
+			return true, pushView(reviewersPicker(repo, it.Number))
+		}
+	case "L":
+		if v.d != nil {
+			return true, pushView(labelsPicker(repo, it.Number, v.d.Labels))
+		}
 	case "A":
 		if v.d == nil {
 			return true, nil
@@ -207,8 +216,18 @@ func (v *itemView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 		}
 	case "W":
 		if it.IsPR {
-			return true, worktreeCmd(v.repo, it.Number)
+			sha := it.HeadSHA
+			if v.d != nil {
+				sha = v.d.HeadSHA
+			}
+			return true, worktreeCmd(v.repo, it.Number, sha)
 		}
+	case "w":
+		if it.IsPR && it.State == "OPEN" && v.d != nil {
+			return true, pushView(workPicker(v.repo, it, v.d))
+		}
+	case "J":
+		return true, focusAgent(it)
 	case "a":
 		if inHerdr() {
 			return true, pushView(newAgentPicker(v.repo, itemPrompt(repo, it, v.d)))
@@ -232,6 +251,33 @@ func (v *itemView) mergePicker() *picker {
 	d, repo := v.d, v.repo.Slug
 	var opts []option
 	verbs := map[string]string{"squash": "Squash and merge", "merge": "Create a merge commit", "rebase": "Rebase and merge"}
+	// Auto-merge: GitHub merges it once checks pass and reviews allow, so nobody has to wait to press the button.
+	if d.AutoMerge != "" {
+		opts = append(opts, option{label: "Stop merging it automatically", detail: "set by " + d.AutoBy + " to " + d.AutoMerge,
+			run: func() tea.Cmd {
+				return func() tea.Msg {
+					if err := setAutoMerge(d.ID, "", "", false); err != nil {
+						return actionMsg{err: err}
+					}
+					return actionMsg{text: fmt.Sprintf("#%d will not merge itself", d.Number), refresh: true}
+				}
+			}})
+	} else if d.AutoAllowed && d.MergeWhy != "CLEAN" && d.MergeWhy != "HAS_HOOKS" && !d.Draft {
+		for _, method := range d.Methods {
+			method := method
+			opts = append(opts, option{label: verbs[method] + ", once it can", detail: "when checks pass and reviews allow; nothing to wait for",
+				run: func() tea.Cmd {
+					v.ask = newConfirmation(fmt.Sprintf("%s #%d into %s once it can?", verbs[method], d.Number, d.Base), func() tea.Msg {
+						if err := setAutoMerge(d.ID, method, d.HeadSHA, true); err != nil {
+							return actionMsg{err: err}
+						}
+						return actionMsg{text: fmt.Sprintf("#%d merges itself once it can", d.Number), refresh: true}
+					})
+					v.ask.require = "merge"
+					return nil
+				}})
+		}
+	}
 	for _, method := range d.Methods {
 		for _, del := range []bool{false, true} {
 			if del && d.Fork {
@@ -347,7 +393,11 @@ func (v *itemView) headLines(w int) []string {
 	if v.d != nil {
 		meta = append(meta, "opened "+age(v.d.Created)+" ago")
 	}
-	lines = append(lines, truncStyledLine(" "+sMuted.Render(strings.Join(meta, " · ")), w))
+	metaLine := " " + sMuted.Render(strings.Join(meta, " · "))
+	if a, ok := agentsOn[it.Head]; ok && it.IsPR && it.State == "OPEN" {
+		metaLine += "  " + agentMark(a) + sMuted.Render(fmt.Sprintf("in pane %s · J goes there", a.Pane))
+	}
+	lines = append(lines, truncStyledLine(metaLine, w))
 	if v.d != nil && it.IsPR {
 		lines = append(lines, truncStyledLine(" "+prSummary(v.d), w))
 	}
@@ -405,6 +455,9 @@ func checksSummary(checks []Check) string {
 
 // mergeLine says whether the pull request can merge, and if not, why.
 func mergeLine(d *Detail) string {
+	if d.AutoMerge != "" {
+		return sGood.Render(fmt.Sprintf("merges itself (%s) once it can", d.AutoMerge)) + sMuted.Render(", set by "+d.AutoBy)
+	}
 	switch {
 	case d.Mergeable == "CONFLICTING" || d.MergeWhy == "DIRTY":
 		return sBad.Render("conflicts with " + d.Base)
@@ -598,12 +651,16 @@ func (v *itemView) footer(w int) string {
 	if it.IsPR {
 		keys = append(keys, [2]string{"d", "diff"}, [2]string{"v", "review"}, [2]string{"s", "checks"})
 		if it.State == "OPEN" {
-			keys = append(keys, [2]string{"m", "merge"}, [2]string{"D", "draft/ready"})
+			keys = append(keys, [2]string{"m", "merge"}, [2]string{"R", "reviewers"}, [2]string{"D", "draft/ready"})
 		}
 		keys = append(keys, [2]string{"C", "checkout"}, [2]string{"W", "worktree"})
+		if inHerdr() && it.State == "OPEN" {
+			keys = append(keys, [2]string{"w", "work on it"})
+		}
 	} else {
 		keys = append(keys, [2]string{"A", "assign me"})
 	}
+	keys = append(keys, [2]string{"L", "labels"})
 	if it.State != "MERGED" {
 		word := "close"
 		if it.State == "CLOSED" {

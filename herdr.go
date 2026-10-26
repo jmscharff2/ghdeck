@@ -139,6 +139,44 @@ func within(path, root string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, "../")
 }
 
+// agentsByBranch finds which branch each of this repo's agents has checked out, so a pull request can show the agent
+// on it. Only local git is asked; when two agents share a branch, the one working wins.
+func agentsByBranch(r Repo) map[string]agent {
+	agents, err := listAgents(r)
+	if err != nil {
+		return nil
+	}
+	rank := map[string]int{"working": 0, "blocked": 1, "idle": 2, "done": 3}
+	out := map[string]agent{}
+	for _, a := range agents {
+		if !a.here || a.Cwd == "" {
+			continue
+		}
+		b := currentBranch(a.Cwd)
+		if b == "" {
+			continue
+		}
+		if have, ok := out[b]; !ok || rank[a.Status] < rank[have.Status] {
+			out[b] = a
+		}
+	}
+	return out
+}
+
+// agentMark is how a list shows the agent on a pull request's branch: its kind, coloured by what it is doing.
+func agentMark(a agent) string {
+	style := sMuted
+	switch a.Status {
+	case "working":
+		style = sWarn
+	case "blocked":
+		style = sBad
+	case "idle", "done":
+		style = sGood
+	}
+	return style.Render("◆ " + or(a.Kind, "agent") + " ")
+}
+
 // sameRepoDir recognizes a worktree of the same repo: git reports the same common directory for it.
 func sameRepoDir(dir string, r Repo) bool {
 	if r.CommonDir == "" {
