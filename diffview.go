@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -358,7 +360,9 @@ func (v *diffView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 		return true, v.toggleViewed()
 	case "S":
 		return true, v.toggleSince()
-	case "c":
+	case "a":
+		return true, v.applySuggestion()
+	case "c", "C":
 		if v.cursor >= len(lines) {
 			return true, nil
 		}
@@ -368,12 +372,20 @@ func (v *diffView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 			v.note = "pick a line of code to comment on"
 			return true, nil
 		}
+		initial := ""
+		if msg.String() == "C" { // suggest a change: the line as it is, to edit into what it should be
+			if side != "RIGHT" {
+				v.note = "a suggestion replaces lines of the new file · pick an added or unchanged line"
+				return true, nil
+			}
+			initial = "```suggestion\n" + l.text + "\n```"
+		}
 		if v.since && side == "LEFT" {
 			v.note = "a removed line here is from your last review, not the base · S shows the whole diff to comment on it"
 			return true, nil
 		}
 		path := v.path()
-		c := newComposer(fmt.Sprintf("Comment on %s:%d", path, n), []string{codeLine(l, 0)}, "")
+		c := newComposer(fmt.Sprintf("Comment on %s:%d", path, n), []string{codeLine(l, 0)}, initial)
 		c.done = func(body string) tea.Cmd {
 			v.drafts = append(v.drafts, DraftComment{Path: path, Line: n, Side: side, Body: body})
 			return v.saveDrafts(fmt.Sprintf("drafted · %d comment(s) wait for v to send the review", len(v.drafts)))
@@ -426,6 +438,101 @@ func (v *diffView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 		}))
 	}
 	return true, nil
+}
+
+// suggestionIn reads the lines a comment suggests, from its first suggestion block.
+func suggestionIn(body string) ([]string, bool) {
+	var out []string
+	in := false
+	for _, line := range strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n") {
+		t := strings.TrimSpace(line)
+		switch {
+		case !in && strings.HasPrefix(t, "```") && strings.TrimSpace(t[3:]) == "suggestion":
+			in = true
+		case in && strings.HasPrefix(t, "```"):
+			return out, true
+		case in:
+			out = append(out, line)
+		}
+	}
+	return nil, false
+}
+
+// applySuggestion writes the suggestion on the cursor's line into your checkout, after asking, when the checkout is
+// at the pull request's head and the lines still read as the diff shows them. It does not commit: that is yours.
+func (v *diffView) applySuggestion() tea.Cmd {
+	ts, _ := v.threadsAt(v.cursor)
+	var c *ReviewComment
+	for _, t := range ts {
+		for _, rc := range append([]ReviewComment{t.root}, t.replies...) {
+			if _, ok := suggestionIn(rc.Body); ok {
+				rc := rc
+				c = &rc
+			}
+		}
+	}
+	if c == nil {
+		v.note = "no suggested change on this line"
+		return nil
+	}
+	root := v.repo.Root
+	if root == "" {
+		v.note = "applying needs a checkout of this repository"
+		return nil
+	}
+	if out, err := runIn(root, "git", "rev-parse", "HEAD"); err != nil || strings.TrimSpace(string(out)) != v.sha {
+		v.note = "your checkout is not at this pull request's head · check it out first (C on the list or the pull request)"
+		return nil
+	}
+	path := v.path()
+	if _, err := runIn(root, "git", "diff", "--quiet", "HEAD", "--", path); err != nil {
+		v.note = path + " has changes you have not committed · commit or stash them first, so the lines match"
+		return nil
+	}
+	start, end := c.StartLine, c.Line
+	if start == 0 {
+		start = end
+	}
+	v.ask = newConfirmation(fmt.Sprintf("Apply %s's suggestion to %s:%d-%d in your checkout?", c.User.Login, path, start, end),
+		func() tea.Msg {
+			if err := applySuggestion(root, path, start, end, c.Body); err != nil {
+				return actionMsg{err: err}
+			}
+			return actionMsg{text: fmt.Sprintf("applied to %s · commit and push it to send the change", path)}
+		})
+	return nil
+}
+
+// applySuggestion replaces lines start through end of a file in the checkout with a comment's suggestion.
+func applySuggestion(root, path string, start, end int, body string) error {
+	repl, ok := suggestionIn(body)
+	if !ok {
+		return fmt.Errorf("no suggestion in the comment")
+	}
+	full := filepath.Join(root, filepath.FromSlash(path))
+	if rel, err := filepath.Rel(root, full); err != nil || strings.HasPrefix(rel, "..") {
+		return fmt.Errorf("%s is outside the checkout", path)
+	}
+	info, err := os.Stat(full)
+	if err != nil {
+		return err
+	}
+	b, err := os.ReadFile(full)
+	if err != nil {
+		return err
+	}
+	text := string(b)
+	trailing := strings.HasSuffix(text, "\n")
+	lines := strings.Split(strings.TrimSuffix(text, "\n"), "\n")
+	if start < 1 || end < start || end > len(lines) {
+		return fmt.Errorf("%s has %d lines; the suggestion is for %d-%d", path, len(lines), start, end)
+	}
+	out := append(append(append([]string{}, lines[:start-1]...), repl...), lines[end:]...)
+	text = strings.Join(out, "\n")
+	if trailing {
+		text += "\n"
+	}
+	return os.WriteFile(full, []byte(text), info.Mode().Perm())
 }
 
 // toggleResolved resolves the thread on the cursor's line, or opens it again.
@@ -940,7 +1047,7 @@ func (v *diffView) View(w, h int) string {
 	head = append(head, sRule.Render(strings.Repeat("─", w)))
 
 	keys := [][2]string{{"↑↓", "line"}, {"n p", "file"}, {"f", "files"}, {"V", "viewed"}, {"t", "next thread"},
-		{"c", "comment"}, {"R", "reply"}, {"z", "resolve"}, {"S", "since review"}, {"v", "send review"}, {"s", "side by side"}, {"w", "wrap"},
+		{"c", "comment"}, {"C", "suggest"}, {"a", "apply suggestion"}, {"R", "reply"}, {"z", "resolve"}, {"S", "since review"}, {"v", "send review"}, {"s", "side by side"}, {"w", "wrap"},
 		{"esc", "back"}}
 	help := keyHelp(keys, w)
 	bodyH := max(1, h-len(head)-1-lipgloss.Height(help))

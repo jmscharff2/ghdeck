@@ -162,6 +162,8 @@ a header for each step.
 | `{` `}` | previous, next hunk |
 | `t` `T` | next, previous line with an open thread or a draft, across files |
 | `c` | draft a comment on this line |
+| `C` | suggest a change to this line: a draft that starts as the line, to edit into what it should be |
+| `a` | apply the suggested change on this line to your checkout, when it is at the pull request's head (asks first; you commit) |
 | `e` `x` | edit, delete your draft on this line |
 | `R` | reply to the thread on this line (posts at once) |
 | `z` | resolve the thread on this line, or open it again; resolved threads fold to a line |

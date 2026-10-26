@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -438,5 +439,31 @@ func TestSplitRowsOldNumbers(t *testing.T) {
 	last := rows[len(rows)-1].text // c: line 10 before, 11 after
 	if !strings.Contains(last, "  10 ") || !strings.Contains(last, "  11 ") {
 		t.Errorf("context should carry its old number on the left and new on the right: %q", last)
+	}
+}
+
+func TestApplySuggestion(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/a.go", []byte("one\ntwo\nthree\nfour\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	body := "Simpler:\n```suggestion\n2 and 3\n```\nWhat do you think?"
+	if got, ok := suggestionIn(body); !ok || len(got) != 1 || got[0] != "2 and 3" {
+		t.Fatalf("suggestionIn = %q %v", got, ok)
+	}
+	if err := applySuggestion(dir, "a.go", 2, 3, body); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(dir + "/a.go"); string(b) != "one\n2 and 3\nfour\n" {
+		t.Errorf("file = %q", b)
+	}
+	if err := applySuggestion(dir, "../outside.go", 1, 1, body); err == nil {
+		t.Error("a path outside the checkout should be refused")
+	}
+	if err := applySuggestion(dir, "a.go", 2, 9, body); err == nil {
+		t.Error("lines past the end should be refused")
+	}
+	if _, ok := suggestionIn("no suggestion here\n```go\nx\n```"); ok {
+		t.Error("an ordinary code block is not a suggestion")
 	}
 }
