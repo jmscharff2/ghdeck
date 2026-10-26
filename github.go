@@ -1140,3 +1140,178 @@ func fetchFilesSince(repo, from, to string) ([]File, error) {
 	}
 	return resp.Files, nil
 }
+
+// ---- reviewers and labels ----
+
+// Reviewer is someone, or a team, who could be asked to review.
+type Reviewer struct {
+	Login     string // a user's login, or a team's slug
+	Name      string
+	Team      bool
+	Requested bool   // asked already
+	Why       string // GitHub's reason to suggest them, when it does
+}
+
+// key names a reviewer across users and teams.
+func (r Reviewer) key() string {
+	if r.Team {
+		return "team:" + r.Login
+	}
+	return r.Login
+}
+
+// fetchReviewers lists who could review a pull request: those asked already, GitHub's suggestions (people who
+// changed this code before), the organization's teams when the token can see them, and everyone who can be assigned.
+func fetchReviewers(repo string, number int) ([]Reviewer, error) {
+	owner, name, _ := strings.Cut(repo, "/")
+	q := `query($o: String!, $n: String!, $num: Int!) {
+		repository(owner: $o, name: $n) {
+			pullRequest(number: $num) {
+				author { login }
+				reviewRequests(first: 50) { nodes { requestedReviewer { __typename ... on User { login name } ... on Team { slug name } } } }
+				suggestedReviewers { isAuthor isCommenter reviewer { login name } }
+			}
+			assignableUsers(first: 100) { nodes { login name } }
+		}
+	}`
+	type person struct {
+		Typename string `json:"__typename"`
+		Login    string `json:"login"`
+		Slug     string `json:"slug"`
+		Name     string `json:"name"`
+	}
+	var resp struct {
+		Repository *struct {
+			PR *struct {
+				Author   gqlLogin `json:"author"`
+				Requests struct {
+					Nodes []struct {
+						Who person `json:"requestedReviewer"`
+					} `json:"nodes"`
+				} `json:"reviewRequests"`
+				Suggested []struct {
+					Author    bool   `json:"isAuthor"`
+					Commenter bool   `json:"isCommenter"`
+					Who       person `json:"reviewer"`
+				} `json:"suggestedReviewers"`
+			} `json:"pullRequest"`
+			Assignable struct {
+				Nodes []person `json:"nodes"`
+			} `json:"assignableUsers"`
+		} `json:"repository"`
+	}
+	if err := ghQuery(q, map[string]any{"o": owner, "n": name, "num": number}, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Repository == nil || resp.Repository.PR == nil {
+		return nil, fmt.Errorf("GitHub has no pull request #%d in %s", number, repo)
+	}
+	pr := resp.Repository.PR
+	author := clean(pr.Author.Login)
+	var out []Reviewer
+	seen := map[string]bool{}
+	add := func(r Reviewer) {
+		if r.Login == "" || seen[r.key()] || !r.Team && r.Login == author {
+			return
+		}
+		seen[r.key()] = true
+		out = append(out, r)
+	}
+	for _, n := range pr.Requests.Nodes {
+		if n.Who.Typename == "Team" {
+			add(Reviewer{Login: clean(n.Who.Slug), Name: clean(n.Who.Name), Team: true, Requested: true})
+		} else {
+			add(Reviewer{Login: clean(n.Who.Login), Name: clean(n.Who.Name), Requested: true})
+		}
+	}
+	for _, s := range pr.Suggested {
+		why := "changed this code before"
+		if s.Commenter {
+			why = "commented on this pull request"
+		}
+		add(Reviewer{Login: clean(s.Who.Login), Name: clean(s.Who.Name), Why: why})
+	}
+	// Teams need the organization's permission to read them; without it, people are enough.
+	var teams struct {
+		Organization *struct {
+			Teams struct {
+				Nodes []person `json:"nodes"`
+			} `json:"teams"`
+		} `json:"organization"`
+	}
+	if ghQuery(`query($o: String!) { organization(login: $o) { teams(first: 50, orderBy: {field: NAME, direction: ASC}) { nodes { slug name } } } }`,
+		map[string]any{"o": owner}, &teams) == nil && teams.Organization != nil {
+		for _, t := range teams.Organization.Teams.Nodes {
+			add(Reviewer{Login: clean(t.Slug), Name: clean(t.Name), Team: true})
+		}
+	}
+	for _, p := range resp.Repository.Assignable.Nodes {
+		add(Reviewer{Login: clean(p.Login), Name: clean(p.Name)})
+	}
+	return out, nil
+}
+
+// setReviewers asks the chosen reviewers and stops asking the ones no longer chosen.
+func setReviewers(repo string, number int, add, remove []Reviewer) error {
+	split := func(rs []Reviewer) map[string]any {
+		users, teams := []string{}, []string{}
+		for _, r := range rs {
+			if r.Team {
+				teams = append(teams, r.Login)
+			} else {
+				users = append(users, r.Login)
+			}
+		}
+		return map[string]any{"reviewers": users, "team_reviewers": teams}
+	}
+	path := fmt.Sprintf("repos/%s/pulls/%d/requested_reviewers", repo, number)
+	if len(remove) > 0 {
+		if err := ghWrite("DELETE", path, split(remove), nil); err != nil {
+			return err
+		}
+	}
+	if len(add) > 0 {
+		return ghWrite("POST", path, split(add), nil)
+	}
+	return nil
+}
+
+type Label struct {
+	Name, Description string
+}
+
+// fetchLabels lists the repository's labels, by name.
+func fetchLabels(repo string) ([]Label, error) {
+	owner, name, _ := strings.Cut(repo, "/")
+	var resp struct {
+		Repository *struct {
+			Labels struct {
+				Nodes []struct {
+					Name        string `json:"name"`
+					Description string `json:"description"`
+				} `json:"nodes"`
+			} `json:"labels"`
+		} `json:"repository"`
+	}
+	if err := ghQuery(`query($o: String!, $n: String!) { repository(owner: $o, name: $n) {
+		labels(first: 100, orderBy: {field: NAME, direction: ASC}) { nodes { name description } } } }`,
+		map[string]any{"o": owner, "n": name}, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Repository == nil {
+		return nil, fmt.Errorf("GitHub has no repository %s that you can see", repo)
+	}
+	var out []Label
+	for _, l := range resp.Repository.Labels.Nodes {
+		out = append(out, Label{Name: clean(l.Name), Description: clean(l.Description)})
+	}
+	return out, nil
+}
+
+// setLabels replaces a pull request's or issue's labels with these.
+func setLabels(repo string, number int, labels []string) error {
+	if labels == nil {
+		labels = []string{}
+	}
+	return ghWrite("PUT", fmt.Sprintf("repos/%s/issues/%d/labels", repo, number), map[string]any{"labels": labels}, nil)
+}

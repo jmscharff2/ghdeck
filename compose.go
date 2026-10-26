@@ -168,6 +168,7 @@ type option struct {
 	detail string
 	match  string // what typing filters on, in a filterable picker: the label when empty
 	run    func() tea.Cmd
+	on     bool // starts ticked, in a multi picker
 }
 
 type pickerLoadedMsg struct {
@@ -194,10 +195,26 @@ type picker struct {
 	filterable bool
 	filter     string
 	extra      func(filter string) []option // offered after the matches, when none is exactly what was typed; not while loading
+	// multi pickers tick several options with space; enter hands done every ticked option's match (or label).
+	multi  bool
+	ticked map[string]bool
+	done   func(ticked []string) tea.Cmd
+	// skipEmpty closes the picker when it loads nothing to choose: an offer, made unasked, that does not apply.
+	skipEmpty bool
 }
 
 func newPicker(title string, opts []option) *picker {
 	return &picker{id: nextViewID(), title: title, opts: opts}
+}
+
+// newMultiPicker ticks several options, starting with those in ticked, and hands done the ones ticked at enter.
+func newMultiPicker(title string, ticked []string, done func([]string) tea.Cmd) *picker {
+	p := newPicker(title, nil)
+	p.multi, p.filterable, p.done, p.ticked = true, true, done, map[string]bool{}
+	for _, t := range ticked {
+		p.ticked[t] = true
+	}
+	return p
 }
 
 func (p *picker) ID() int { return p.id }
@@ -219,6 +236,14 @@ func (p *picker) Update(msg tea.Msg) (bool, tea.Cmd) {
 	switch msg := msg.(type) {
 	case pickerLoadedMsg:
 		p.loading, p.opts, p.err = false, msg.opts, msg.err
+		if p.skipEmpty && msg.err == nil && len(msg.opts) == 0 {
+			return false, nil
+		}
+		for _, o := range p.opts {
+			if o.on && p.ticked != nil {
+				p.ticked[or(o.match, o.label)] = true
+			}
+		}
 	case tea.KeyMsg:
 		shown := p.shown()
 		key := msg.String()
@@ -235,6 +260,12 @@ func (p *picker) Update(msg tea.Msg) (bool, tea.Cmd) {
 			case msg.Type == tea.KeyRunes:
 				p.filter, p.sel = p.filter+string(msg.Runes), 0
 				return true, nil
+			case p.multi && key == " ":
+				if p.sel < len(shown) {
+					k := or(shown[p.sel].match, shown[p.sel].label)
+					p.ticked[k] = !p.ticked[k]
+				}
+				return true, nil
 			case key == "j" || key == "k" || key == "q":
 				return true, nil // letters filter here; arrows move
 			}
@@ -247,6 +278,18 @@ func (p *picker) Update(msg tea.Msg) (bool, tea.Cmd) {
 		case "down", "j":
 			p.sel = max(0, min(len(shown)-1, p.sel+1))
 		case "enter":
+			if p.multi {
+				var out []string
+				for _, o := range p.opts { // in the order offered
+					if k := or(o.match, o.label); p.ticked[k] {
+						out = append(out, k)
+					}
+				}
+				if p.done == nil {
+					return false, nil
+				}
+				return false, p.done(out)
+			}
 			if p.sel < len(shown) {
 				if run := shown[p.sel].run; run != nil {
 					return false, run()
@@ -312,6 +355,13 @@ func (p *picker) View(w, h int) string {
 	for i, o := range shown {
 		cursor := "  "
 		label := o.label
+		if p.multi {
+			box := sMuted.Render("☐ ")
+			if p.ticked[or(o.match, o.label)] {
+				box = sGood.Render("☑ ")
+			}
+			label = box + label
+		}
 		if i == p.sel {
 			cursor = sTitle.Render("▸ ")
 			label = sBold.Render(label)
@@ -323,6 +373,9 @@ func (p *picker) View(w, h int) string {
 		}
 	}
 	keys := [][2]string{{"↑↓", "choose"}, {"enter", "go"}}
+	if p.multi {
+		keys = [][2]string{{"↑↓", "choose"}, {"space", "tick"}, {"enter", "apply"}}
+	}
 	keys = append(keys, p.keys...)
 	keys = append(keys, [2]string{"esc", "cancel"})
 	help := keyHelp(keys, w)

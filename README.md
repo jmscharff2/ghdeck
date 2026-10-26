@@ -108,8 +108,9 @@ commits, the files, whether the branch is behind, any pull request already open 
 a long-lived branch would go into a feature branch. A promotion such as `staging` into `main` starts as "Merge staging
 into main" with the pull requests it carries listed, as release notes, and any commits pushed straight to the branch
 after them. A single commit starts with its own message. The repository's pull request template comes first. The
-first line is the title. It can open as a draft. A branch that is not pushed yet, or is on your fork, goes to
-`gh pr create`, which pushes it and handles forks.
+first line is the title. It can open as a draft. Once it is created, ghdeck asks who should review it, GitHub's
+suggestions first. A branch that is not pushed yet, or is on your fork, goes to `gh pr create`, which pushes it and
+handles forks.
 
 **A run.** Its jobs, with the chosen job's steps beneath it, live while it runs. `enter` streams the job's log with
 a header for each step.
@@ -146,6 +147,8 @@ a header for each step.
 | `D` | convert to draft, or mark ready for review |
 | `x` | close or reopen (type `yes`) |
 | `A` | assign yourself |
+| `R` | reviewers: GitHub's suggestions first, teams, and anyone who can be assigned (space ticks, typing filters) |
+| `L` | labels |
 | `C` `W` | check out here, or in a worktree |
 | `p` | an issue's linked pull request |
 | `a` `o` `r` | hand to an agent, open on GitHub, refresh |

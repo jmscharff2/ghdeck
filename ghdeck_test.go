@@ -467,3 +467,18 @@ func TestApplySuggestion(t *testing.T) {
 		t.Error("an ordinary code block is not a suggestion")
 	}
 }
+
+// Space ticks, typing filters, and enter hands over what is ticked, in the order offered.
+func TestMultiPicker(t *testing.T) {
+	var got []string
+	p := newMultiPicker("Labels", []string{"bug"}, func(ticked []string) tea.Cmd { got = ticked; return nil })
+	p.Update(pickerLoadedMsg{id: p.id, opts: []option{{label: "bug"}, {label: "docs"}, {label: "release", on: true}}})
+	for _, r := range "doc" {
+		p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	p.Update(tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}})
+	p.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if strings.Join(got, ",") != "bug,docs,release" {
+		t.Errorf("ticked = %q", got)
+	}
+}

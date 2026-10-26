@@ -292,9 +292,17 @@ func prComposer(r Repo, base, head string, cmp *Comparison, draft bool) *compose
 	}
 	c.done = func(string) tea.Cmd {
 		it := made
-		return tea.Batch(
-			func() tea.Msg { return actionMsg{text: fmt.Sprintf("created #%d", it.Number), refresh: true} },
-			pushView(newItemView(r, it)))
+		// Then who should review it, GitHub's suggestions first; esc leaves it to later (R).
+		return tea.Sequence(
+			func() tea.Msg {
+				return actionMsg{text: fmt.Sprintf("created #%d · esc to skip reviewers", it.Number), refresh: true}
+			},
+			pushView(newItemView(r, it)),
+			func() tea.Msg {
+				p := reviewersPicker(r.Slug, it.Number)
+				p.skipEmpty = true // nobody to ask, in a repository of one
+				return pushViewMsg{p}
+			})
 	}
 	return c
 }
@@ -436,4 +444,99 @@ func plural(n int, word string) string {
 		return "1 " + word
 	}
 	return fmt.Sprintf("%d %ss", n, word)
+}
+
+// reviewersPicker asks for reviewers: GitHub's suggestions first, those asked already ticked. The view underneath
+// reloads after.
+func reviewersPicker(repo string, number int) *picker {
+	var all []Reviewer // set by load, read by done once it has loaded
+	p := newMultiPicker(fmt.Sprintf("Reviewers for #%d", number), nil, nil)
+	p.load = func() ([]option, error) {
+		rs, err := fetchReviewers(repo, number)
+		if err != nil {
+			return nil, err
+		}
+		all = rs
+		var opts []option
+		for _, r := range rs {
+			label, detail := r.Login, r.Name
+			if r.Team {
+				label = "team " + r.Login
+			}
+			if r.Why != "" {
+				detail = strings.TrimPrefix(detail+" · ", " · ") + sGood.Render("suggested: "+r.Why)
+			}
+			opts = append(opts, option{label: label, match: r.key(), detail: detail, on: r.Requested})
+		}
+		return opts, nil
+	}
+	p.done = func(ticked []string) tea.Cmd {
+		want := map[string]bool{}
+		for _, k := range ticked {
+			want[k] = true
+		}
+		var add, remove []Reviewer
+		for _, r := range all {
+			switch {
+			case want[r.key()] && !r.Requested:
+				add = append(add, r)
+			case !want[r.key()] && r.Requested:
+				remove = append(remove, r)
+			}
+		}
+		if len(add)+len(remove) == 0 {
+			return nil
+		}
+		return func() tea.Msg {
+			if err := setReviewers(repo, number, add, remove); err != nil {
+				return actionMsg{err: err}
+			}
+			var names []string
+			for _, r := range add {
+				names = append(names, r.Login)
+			}
+			text := "asked " + strings.Join(names, ", ")
+			if len(add) == 0 {
+				text = fmt.Sprintf("stopped asking %s", plural(len(remove), "reviewer"))
+			}
+			return actionMsg{text: text, refresh: true}
+		}
+	}
+	return p
+}
+
+// labelsPicker sets a pull request's or issue's labels, those on it already ticked.
+func labelsPicker(repo string, number int, current []string) *picker {
+	p := newMultiPicker(fmt.Sprintf("Labels for #%d", number), current, nil)
+	p.load = func() ([]option, error) {
+		ls, err := fetchLabels(repo)
+		if err != nil {
+			return nil, err
+		}
+		var opts []option
+		for _, l := range ls {
+			opts = append(opts, option{label: l.Name, match: l.Name, detail: l.Description})
+		}
+		return opts, nil
+	}
+	p.done = func(ticked []string) tea.Cmd {
+		had := map[string]bool{}
+		for _, l := range current {
+			had[l] = true
+		}
+		same := len(ticked) == len(current)
+		for _, l := range ticked {
+			same = same && had[l]
+		}
+		if same {
+			return nil
+		}
+		return func() tea.Msg {
+			if err := setLabels(repo, number, ticked); err != nil {
+				return actionMsg{err: err}
+			}
+			return actionMsg{text: fmt.Sprintf("labels: %s", or(strings.Join(ticked, ", "), "none")), refresh: true}
+		}
+	}
+	return p
 }

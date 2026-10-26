@@ -181,6 +181,14 @@ func (v *itemView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 			}
 			return actionMsg{text: fmt.Sprintf("#%d %s", it.Number, map[string]string{"closed": "closed", "open": "reopened"}[state]), refresh: true}
 		})
+	case "R":
+		if it.IsPR && v.d != nil && it.State == "OPEN" {
+			return true, pushView(reviewersPicker(repo, it.Number))
+		}
+	case "L":
+		if v.d != nil {
+			return true, pushView(labelsPicker(repo, it.Number, v.d.Labels))
+		}
 	case "A":
 		if v.d == nil {
 			return true, nil
@@ -598,12 +606,13 @@ func (v *itemView) footer(w int) string {
 	if it.IsPR {
 		keys = append(keys, [2]string{"d", "diff"}, [2]string{"v", "review"}, [2]string{"s", "checks"})
 		if it.State == "OPEN" {
-			keys = append(keys, [2]string{"m", "merge"}, [2]string{"D", "draft/ready"})
+			keys = append(keys, [2]string{"m", "merge"}, [2]string{"R", "reviewers"}, [2]string{"D", "draft/ready"})
 		}
 		keys = append(keys, [2]string{"C", "checkout"}, [2]string{"W", "worktree"})
 	} else {
 		keys = append(keys, [2]string{"A", "assign me"})
 	}
+	keys = append(keys, [2]string{"L", "labels"})
 	if it.State != "MERGED" {
 		word := "close"
 		if it.State == "CLOSED" {
