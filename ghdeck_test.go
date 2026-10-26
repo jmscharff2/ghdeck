@@ -375,3 +375,68 @@ func TestDiffResolvedThreads(t *testing.T) {
 		t.Errorf("t went to line %d, want the open thread on 3", v.cursor)
 	}
 }
+
+// Side by side, a removed line faces the line that replaced it, and context faces itself.
+func TestSplitRows(t *testing.T) {
+	v := newDiffView(Repo{Slug: "o/r"}, 1, "t")
+	v.drafts = nil
+	v.files = []File{{Path: "main.go", Patch: "@@ -1,3 +1,4 @@\n package main\n-func old() {}\n+func new() {}\n+func more() {}\n // end"}}
+	v.split = true
+	rows := v.rows(140)
+	var code []string
+	for _, r := range rows {
+		if r.code {
+			code = append(code, r.text)
+		}
+	}
+	if len(code) != 5 { // header, context, the changed pair, the extra added line, context
+		t.Fatalf("got %d code rows:\n%s", len(code), strings.Join(code, "\n"))
+	}
+	if !strings.Contains(code[2], "func old()") || !strings.Contains(code[2], "func new()") {
+		t.Errorf("old and new should face each other: %q", code[2])
+	}
+	if strings.Count(code[1], "package main") != 2 {
+		t.Errorf("context should show on both sides: %q", code[1])
+	}
+	for _, r := range rows {
+		if w := lipgloss.Width(r.text); w > 140 {
+			t.Errorf("row is %d wide, over 140: %q", w, r.text)
+		}
+	}
+	if !rows[2].has(2) || !rows[2].has(3) {
+		t.Errorf("the pair's row should hold both lines: %+v", rows[2])
+	}
+}
+
+func TestParseTarget(t *testing.T) {
+	for in, want := range map[string]target{
+		"482":                           {number: 482},
+		"#482":                          {number: 482},
+		"cli/cli#12":                    {repo: "cli/cli", number: 12},
+		"https://github.com/o/r/pull/7": {repo: "o/r", number: 7},
+		"https://github.com/o/r/pull/7/files#diff-abc":    {repo: "o/r", number: 7, files: true},
+		"https://github.com/o/r/issues/9":                 {repo: "o/r", number: 9},
+		"https://github.com/o/r/actions/runs/123/job/456": {repo: "o/r", run: 123},
+	} {
+		if got, ok := parseTarget(in); !ok || got != want {
+			t.Errorf("parseTarget(%q) = %+v %v, want %+v", in, got, ok, want)
+		}
+	}
+	for _, bad := range []string{"", "abc", "http://github.com/o/r/pull/7", "https://evil.example/o/r/pull/7", "https://github.com/o/r"} {
+		if _, ok := parseTarget(bad); ok {
+			t.Errorf("parseTarget(%q) should refuse", bad)
+		}
+	}
+}
+
+func TestSplitRowsOldNumbers(t *testing.T) {
+	v := newDiffView(Repo{Slug: "o/r"}, 1, "t")
+	v.drafts = nil
+	v.files = []File{{Path: "x.txt", Patch: "@@ -9,2 +9,3 @@\n a\n+b\n c"}}
+	v.split = true
+	rows := v.rows(140)
+	last := rows[len(rows)-1].text // c: line 10 before, 11 after
+	if !strings.Contains(last, "  10 ") || !strings.Contains(last, "  11 ") {
+		t.Errorf("context should carry its old number on the left and new on the right: %q", last)
+	}
+}

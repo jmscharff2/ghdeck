@@ -83,6 +83,8 @@ type model struct {
 
 	// openBranch opens the branch's pull request as soon as the first status says which it is.
 	openBranch bool
+	// openTarget opens a pull request, issue or run at once (-open).
+	openTarget *target
 
 	// seen remembers what was already there, so only news is announced.
 	seenReviews map[int]bool
@@ -94,7 +96,11 @@ func newModel(r Repo) model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(m.refreshStatus(), m.refreshTab(tabPRs), m.tick())
+	cmds := []tea.Cmd{m.refreshStatus(), m.refreshTab(tabPRs), m.tick()}
+	if t := m.openTarget; t != nil {
+		cmds = append(cmds, pushView(t.view(m.repo)))
+	}
+	return tea.Batch(cmds...)
 }
 
 func load(key, query string, f func() (any, error)) tea.Cmd {

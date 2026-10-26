@@ -32,7 +32,8 @@ and put it on your `PATH`.
 
 Run it anywhere inside a checkout. It finds the repository from the remote that `gh repo set-default` chose, else
 `origin`, else the first GitHub remote. `ghdeck -R owner/name` opens any repository, and `ghdeck -branch` opens
-straight onto the pull request for the checked-out branch.
+straight onto the pull request for the checked-out branch. `ghdeck -open` takes a number, `owner/name#123`, or a link
+to a pull request, issue or Actions run; a pull request's `/files` link opens its diff.
 
 ### As a Herdr plugin
 
@@ -88,7 +89,7 @@ branch's pull request with its checks and review state, and how many pull reques
 **A pull request.** Its merge state, a summary of its checks and reviewers, the description, the checks (failing
 ones first), unresolved review threads, and the conversation: comments, reviews, commits, merges.
 
-**The diff.** One file at a time, with each review thread under the line it is on and outdated threads at the top
+**The diff.** One file at a time, its code highlighted for the language and added and removed lines tinted, with each review thread under the line it is on and outdated threads at the top
 of their file. `c` drafts a comment on the line under the cursor. Drafts are saved as you write them (in
 `~/Library/Caches/ghdeck` on macOS, `~/.cache/ghdeck` on Linux), so closing the pane loses nothing. `v` sends every
 draft as one review, with a verdict and a summary.
@@ -165,6 +166,7 @@ a header for each step.
 | `R` | reply to the thread on this line (posts at once) |
 | `z` | resolve the thread on this line, or open it again; resolved threads fold to a line |
 | `v` | send the review |
+| `s` | old and new side by side, in a pane 120 columns or wider |
 | `w` | wrap long lines on or off |
 | `o` | the files on GitHub |
 

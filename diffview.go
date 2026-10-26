@@ -79,6 +79,7 @@ type diffDataMsg struct {
 	comments []ReviewComment
 	state    *ReviewState
 	sha      string
+	title    string
 	err      error
 }
 
@@ -116,14 +117,17 @@ type diffView struct {
 	cursor int // index into the file's lines
 	scroll int // first display row shown
 	wrap   bool
+	split  bool // old and new side by side, in a wide pane (s)
 	parsed map[int][]diffLine
+	hl     map[string]*highlighter // by path
 	ask    *confirmation
 	note   string
+	width  int // the last width drawn at
 }
 
 func newDiffView(r Repo, number int, title string) *diffView {
 	return &diffView{id: nextViewID(), repo: r, number: number, title: title, wrap: true, parsed: map[int][]diffLine{},
-		drafts: loadDrafts(r.Slug, number)}
+		hl: map[string]*highlighter{}, drafts: loadDrafts(r.Slug, number)}
 }
 
 func (v *diffView) ID() int          { return v.id }
@@ -136,7 +140,8 @@ func (v *diffView) fetch() tea.Cmd {
 	id, repo, n := v.id, v.repo.Slug, v.number
 	return func() tea.Msg {
 		var pr struct {
-			Head struct {
+			Title string `json:"title"`
+			Head  struct {
 				SHA string `json:"sha"`
 			} `json:"head"`
 		}
@@ -152,7 +157,7 @@ func (v *diffView) fetch() tea.Cmd {
 			return diffDataMsg{id: id, err: err}
 		}
 		state, err := fetchReviewState(repo, n)
-		return diffDataMsg{id: id, files: files, comments: comments, state: state, sha: clean(pr.Head.SHA), err: err}
+		return diffDataMsg{id: id, files: files, comments: comments, state: state, sha: clean(pr.Head.SHA), title: clean(pr.Title), err: err}
 	}
 }
 
@@ -179,6 +184,9 @@ func (v *diffView) Update(msg tea.Msg) (bool, tea.Cmd) {
 		}
 		if msg.state != nil {
 			v.state = msg.state
+		}
+		if msg.title != "" {
+			v.title = msg.title
 		}
 		if msg.files != nil {
 			if v.since { // keep showing what changed since the review; the whole is for when S goes back
@@ -333,6 +341,11 @@ func (v *diffView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 		v.seekThread(-1)
 	case "w":
 		v.wrap = !v.wrap
+	case "s":
+		v.split = !v.split
+		if v.split && v.width > 0 && v.width < splitMin {
+			v.note = fmt.Sprintf("side by side needs a pane %d columns wide; this one is %d", splitMin, v.width)
+		}
 	case "f":
 		return true, pushView(v.filePicker())
 	case "r":
@@ -651,25 +664,46 @@ func fileStatusIcon(status string) string {
 
 // ---- drawing ----
 
-// row is one screen row of the diff, and the line it belongs to.
+// row is one screen row of the diff, and the line it belongs to: two, side by side, where a removed line faces the
+// line that replaced it.
 type row struct {
 	text string
 	line int
+	alt  int  // the other side's line, side by side; -1 when none
 	code bool // a row of the line itself, rather than of a thread under it
 }
+
+func (r row) has(i int) bool { return r.line == i || r.alt == i && r.alt >= 0 }
+
+// highlighter is the current file's, made on first use.
+func (v *diffView) highlighter() *highlighter {
+	p := v.path()
+	h, ok := v.hl[p]
+	if !ok {
+		h = newHighlighter(p)
+		v.hl[p] = h
+	}
+	return h
+}
+
+// splitMin is the narrowest pane that shows the diff side by side: two halves wide enough to read.
+const splitMin = 120
 
 const gutterW = 7 // "▸1234 +"
 
 // codeLine draws a diff line's gutter and text on one row, cut at w when w > 0.
-func codeLine(l diffLine, w int) string { return codeRows(l, w, false)[0] }
+func codeLine(l diffLine, w int) string { return codeRows(l, w, false, nil)[0] }
 
-func codeRows(l diffLine, w int, wrap bool) []string {
+// codeRows draws a diff line, wrapped to w or cut there, its code coloured by hl when hl knows the language. Added
+// and removed lines are tinted across the full width.
+func codeRows(l diffLine, w int, wrap bool, hl *highlighter) []string {
 	num := l.new
 	if l.kind == '-' {
 		num = l.old
 	}
 	text := strings.ReplaceAll(l.text, "\t", "    ")
-	var style lipgloss.Style
+	plain := hl == nil || hl.lexer == nil
+	var bg, fg lipgloss.TerminalColor
 	gutter := ""
 	switch l.kind {
 	case '@':
@@ -677,29 +711,44 @@ func codeRows(l diffLine, w int, wrap bool) []string {
 	case '\\':
 		return []string{sMuted.Render("        " + text)}
 	case '+':
-		style, gutter = sGood, sMuted.Render(fmt.Sprintf("%4d ", num))+sGood.Render("+")
+		bg, gutter = cAddBg, sMuted.Render(fmt.Sprintf("%4d ", num))+sGood.Render("+")
+		if plain {
+			fg = cGood
+		}
 	case '-':
-		style, gutter = sBad, sMuted.Render(fmt.Sprintf("%4d ", num))+sBad.Render("−")
+		bg, gutter = cDelBg, sMuted.Render(fmt.Sprintf("%4d ", num))+sBad.Render("−")
+		if plain {
+			fg = cBad
+		}
 	default:
-		style, gutter = lipgloss.NewStyle(), sMuted.Render(fmt.Sprintf("%4d  ", num))
+		gutter = sMuted.Render(fmt.Sprintf("%4d  ", num))
 	}
+	runs := hl.runs(text)
+	n := len([]rune(text))
 	avail := w - gutterW
+	fill := func(used int) string { // the tint carries on to the edge
+		if bg == nil || avail-used <= 0 {
+			return ""
+		}
+		return lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", avail-used))
+	}
 	if w <= 0 || avail < 10 {
-		return []string{gutter + " " + style.Render(text)}
+		return []string{gutter + " " + slice(runs, 0, n, bg, fg)}
 	}
 	if !wrap {
-		return []string{gutter + " " + style.Render(truncate(text, avail))}
+		if n > avail {
+			return []string{gutter + " " + slice(runs, 0, avail-1, bg, fg) + sMuted.Render("…")}
+		}
+		return []string{gutter + " " + slice(runs, 0, n, bg, fg) + fill(n)}
 	}
-	r := []rune(text)
 	var rows []string
-	for first := true; first || len(r) > 0; first = false {
-		n := min(avail, len(r))
+	for at := 0; at == 0 || at < n; at += avail {
 		lead := gutter + " "
-		if !first {
+		if at > 0 {
 			lead = strings.Repeat(" ", gutterW)
 		}
-		rows = append(rows, lead+style.Render(string(r[:n])))
-		r = r[n:]
+		end := min(n, at+avail)
+		rows = append(rows, lead+slice(runs, at, end, bg, fg)+fill(end-at))
 	}
 	return rows
 }
@@ -740,42 +789,129 @@ func (v *diffView) rows(w int) []row {
 	var out []row
 	lines := v.lines()
 	if od := v.outdated(); len(od) > 0 {
-		out = append(out, row{text: sMuted.Render(fmt.Sprintf(" %d outdated thread(s), on code that has changed since:", len(od))), line: -1})
+		out = append(out, row{text: sMuted.Render(fmt.Sprintf(" %d outdated thread(s), on code that has changed since:", len(od))), line: -1, alt: -1})
 		for _, t := range od {
-			out = append(out, row{text: "      " + sMuted.Render(fmt.Sprintf("line %d", t.root.Original)), line: -1})
+			out = append(out, row{text: "      " + sMuted.Render(fmt.Sprintf("line %d", t.root.Original)), line: -1, alt: -1})
 			for _, r := range threadRows(t, w) {
-				out = append(out, row{text: r, line: -1})
+				out = append(out, row{text: r, line: -1, alt: -1})
 			}
 		}
-		out = append(out, row{line: -1})
+		out = append(out, row{line: -1, alt: -1})
 	}
+	if v.split && w >= splitMin {
+		return append(out, v.splitRows(w)...)
+	}
+	hl := v.highlighter()
 	for i, l := range lines {
-		for _, r := range codeRows(l, w, v.wrap) {
-			out = append(out, row{text: r, line: i, code: true})
+		for _, r := range codeRows(l, w, v.wrap, hl) {
+			out = append(out, row{text: r, line: i, alt: -1, code: true})
 		}
+		out = append(out, v.notesRows(i, w)...)
+	}
+	return out
+}
+
+// notesRows draws the threads and drafts under line i.
+func (v *diffView) notesRows(i, w int) []row {
+	var out []row
+	{
 		ts, ds := v.threadsAt(i)
 		for _, t := range ts {
 			if v.resolved(t) { // folded to a line: done with, but still there
 				first, _, _ := strings.Cut(t.root.Body, "\n")
 				text := fmt.Sprintf("      %s %s · %s", sGood.Render("✓ resolved"), sMuted.Render(t.root.User.Login+": "+first),
 					sMuted.Render(plural(1+len(t.replies), "comment")+" · z opens it"))
-				out = append(out, row{text: truncStyledLine(text, w), line: i})
+				out = append(out, row{text: truncStyledLine(text, w), line: i, alt: -1})
 				continue
 			}
 			for _, r := range threadRows(t, w) {
-				out = append(out, row{text: r, line: i})
+				out = append(out, row{text: r, line: i, alt: -1})
 			}
 		}
 		for _, j := range ds {
 			for _, r := range draftRows(v.drafts[j], w) {
-				out = append(out, row{text: r, line: i})
+				out = append(out, row{text: r, line: i, alt: -1})
 			}
 		}
 	}
 	return out
 }
 
+// splitRows lays the diff out side by side: the old file on the left, the new on the right. Within a change, the
+// removed lines face the added ones that replaced them; context lines face themselves.
+func (v *diffView) splitRows(w int) []row {
+	lines, hl := v.lines(), v.highlighter()
+	half := (w - 1) / 2
+	sep := sRule.Render("│")
+	var out []row
+	cell := func(i int, old bool) []string {
+		if i < 0 {
+			return []string{""}
+		}
+		l := lines[i]
+		if old { // a context line on the left goes by its number in the old file
+			l.new = l.old
+		}
+		return codeRows(l, half, v.wrap, hl)
+	}
+	pair := func(left, right int) {
+		l, r := cell(left, true), cell(right, false)
+		for k := 0; k < max(len(l), len(r)); k++ {
+			a, b := "", ""
+			if k < len(l) {
+				a = l[k]
+			}
+			if k < len(r) {
+				b = r[k]
+			}
+			line, alt := left, right
+			if line < 0 {
+				line, alt = right, -1
+			}
+			out = append(out, row{text: pad(truncStyledLine(a, half), half) + sep + truncStyledLine(b, half), line: line, alt: alt, code: true})
+		}
+		if left >= 0 {
+			out = append(out, v.notesRows(left, w)...)
+		}
+		if right >= 0 && right != left {
+			out = append(out, v.notesRows(right, w)...)
+		}
+	}
+	for i := 0; i < len(lines); {
+		switch lines[i].kind {
+		case '-', '+':
+			var dels, adds []int
+			for ; i < len(lines) && lines[i].kind == '-'; i++ {
+				dels = append(dels, i)
+			}
+			for ; i < len(lines) && lines[i].kind == '+'; i++ {
+				adds = append(adds, i)
+			}
+			for k := 0; k < max(len(dels), len(adds)); k++ {
+				left, right := -1, -1
+				if k < len(dels) {
+					left = dels[k]
+				}
+				if k < len(adds) {
+					right = adds[k]
+				}
+				pair(left, right)
+			}
+		case ' ':
+			pair(i, i)
+			i++
+		default: // a hunk header, or "no newline at end of file", across both
+			for _, r := range codeRows(lines[i], w, false, hl) {
+				out = append(out, row{text: r, line: i, alt: -1, code: true})
+			}
+			i++
+		}
+	}
+	return out
+}
+
 func (v *diffView) View(w, h int) string {
+	v.width = w
 	var head []string
 	title := fmt.Sprintf("#%d %s", v.number, v.title)
 	spin := ""
@@ -804,7 +940,7 @@ func (v *diffView) View(w, h int) string {
 	head = append(head, sRule.Render(strings.Repeat("─", w)))
 
 	keys := [][2]string{{"↑↓", "line"}, {"n p", "file"}, {"f", "files"}, {"V", "viewed"}, {"t", "next thread"},
-		{"c", "comment"}, {"R", "reply"}, {"z", "resolve"}, {"S", "since review"}, {"v", "send review"}, {"w", "wrap"},
+		{"c", "comment"}, {"R", "reply"}, {"z", "resolve"}, {"S", "since review"}, {"v", "send review"}, {"s", "side by side"}, {"w", "wrap"},
 		{"esc", "back"}}
 	help := keyHelp(keys, w)
 	bodyH := max(1, h-len(head)-1-lipgloss.Height(help))
@@ -821,7 +957,7 @@ func (v *diffView) View(w, h int) string {
 		// Keep the cursor's line on screen, with room for the threads under it when they fit.
 		first, lastRow := -1, -1
 		for i, r := range rows {
-			if r.line == v.cursor {
+			if r.has(v.cursor) {
 				if first < 0 && r.code {
 					first = i
 				}
@@ -843,7 +979,7 @@ func (v *diffView) View(w, h int) string {
 		for i := v.scroll; i < len(rows) && i < v.scroll+bodyH; i++ {
 			r := rows[i]
 			text := r.text
-			if r.code && r.line == v.cursor {
+			if r.code && r.has(v.cursor) {
 				text = sTitle.Render("▸") + strings.TrimPrefix(text, " ")
 				text = lipgloss.NewStyle().Background(cSelBg).Render(pad(truncStyledLine(text, w), w))
 			}
