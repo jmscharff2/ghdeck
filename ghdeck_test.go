@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -211,5 +212,140 @@ func TestPaceSlowsWhenIdle(t *testing.T) {
 	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
 	if idle() || cmd == nil {
 		t.Error("a key should end the idle spell and wake the deck")
+	}
+}
+
+func TestPRDraft(t *testing.T) {
+	release := &Comparison{Ahead: 3, Commits: []Commit{{SHA: "aaaaaaa1", Subject: "Add login"}, {SHA: "bbbbbbb2", Subject: "Fix logout"}}}
+	title, body := prDraft("staging", "master", release, "## Checklist")
+	if title != "Merge staging into master" {
+		t.Errorf("title = %q", title)
+	}
+	for _, want := range []string{"## Checklist", "- Add login (aaaaaaa)", "- Fix logout (bbbbbbb)", "…and 1 more"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body lacks %q:\n%s", want, body)
+		}
+	}
+	if strings.Index(body, "## Checklist") > strings.Index(body, "## Commits") {
+		t.Error("the template should come first")
+	}
+	one := &Comparison{Ahead: 1, Commits: []Commit{{SHA: "c", Subject: "Fix the redirect", Body: "It looped."}}}
+	if title, body := prDraft("fix", "main", one, ""); title != "Fix the redirect" || body != "It looped." {
+		t.Errorf("one commit = %q, %q", title, body)
+	}
+}
+
+func TestRefPath(t *testing.T) {
+	if got := refPath("release/2026-10 #4"); got != "release/2026-10%20%234" {
+		t.Errorf("refPath = %q", got)
+	}
+}
+
+// A long branch list filters as you type, and scrolls to keep the chosen branch in sight.
+func TestPickerFilterAndScroll(t *testing.T) {
+	var opts []option
+	for i := 0; i < 40; i++ {
+		opts = append(opts, option{label: fmt.Sprintf("branch-%02d", i), detail: "detail"})
+	}
+	p := newPicker("Branches", opts)
+	p.filterable = true
+	for i := 0; i < 30; i++ {
+		p.Update(tea.KeyMsg{Type: tea.KeyDown})
+	}
+	if out := p.View(60, 20); !strings.Contains(out, "▸ branch-30") {
+		t.Errorf("the chosen branch scrolled out of sight:\n%s", out)
+	}
+	for _, r := range "-3" {
+		p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	shown := p.shown()
+	if len(shown) != 10 || shown[0].label != "branch-30" {
+		t.Errorf("filter -3 shows %d, first %q", len(shown), shown[0].label)
+	}
+	if open, _ := p.Update(tea.KeyMsg{Type: tea.KeyEsc}); !open || p.filter != "" {
+		t.Error("esc should clear the filter before it closes the picker")
+	}
+}
+
+// A repository that works through develop: features go there, develop goes to staging, staging to main.
+func gitFlow() BranchInfo {
+	now := time.Now()
+	return BranchInfo{
+		Default: "main",
+		Branches: []Branch{{Name: "feature/login", Date: now}, {Name: "release/1.5", Date: now}, {Name: "develop", Date: now},
+			{Name: "staging", Date: now}, {Name: "main", Date: now}},
+		Recent: []RecentPR{ // the most recent first
+			{Number: 40, Head: "feature/search", Base: "develop"},
+			{Number: 39, Head: "staging", Base: "main"},
+			{Number: 38, Head: "develop", Base: "staging"},
+			{Number: 37, Head: "fix-typo", Base: "develop"},
+			{Number: 36, Head: "release/1.4", Base: "main"},
+			{Number: 35, Head: "readme", Base: "main", Fork: true}, // someone else's habits
+			{Number: 34, Head: "feature/cart", Base: "develop"},
+		},
+	}
+}
+
+func TestGuessBases(t *testing.T) {
+	info := gitFlow()
+	for head, want := range map[string]string{
+		"staging":     "main",    // where it went last time
+		"develop":     "staging", // the same
+		"release/1.5": "main",    // where release/1.4 went
+		"new-thing":   "develop", // where feature branches go
+	} {
+		got := guessBases(info, head)
+		if len(got) == 0 || got[0].name != want {
+			t.Errorf("%s: first guess %+v, want %s", head, got, want)
+			continue
+		}
+		t.Logf("%s → %s: %s", head, got[0].name, got[0].why)
+		for _, g := range got {
+			if g.name == head {
+				t.Errorf("%s offered as its own base", head)
+			}
+		}
+	}
+	if g := guessBases(info, "new-thing")[0].why; g != "where 3 of the last 4 feature pull requests went" {
+		t.Errorf("why = %q", g)
+	}
+	// A repository with no history: the default branch first.
+	bare := BranchInfo{Default: "main", Branches: []Branch{{Name: "x"}, {Name: "main"}}}
+	if g := guessBases(bare, "x"); g[0].name != "main" {
+		t.Errorf("no history: first guess %q", g[0].name)
+	}
+}
+
+func TestBackwards(t *testing.T) {
+	info := gitFlow()
+	if !backwards(info, "feature/login", "main") {
+		t.Error("main into a feature branch should warn")
+	}
+	if backwards(info, "main", "staging") || backwards(info, "develop", "feature/login") {
+		t.Error("promotions and features should not warn")
+	}
+}
+
+// staging carries #12, merged with a merge commit and two commits of its own; #13, squashed; a merge of main back
+// in; and one commit pushed straight to staging.
+func TestReleaseNotes(t *testing.T) {
+	commits := []Commit{
+		{SHA: "f1", Subject: "Start login", Parents: []string{"m0"}},
+		{SHA: "f2", Subject: "Finish login", Parents: []string{"f1"}},
+		{SHA: "s1", Subject: "Merge pull request #12 from me/login", Body: "Add login", Parents: []string{"m0", "f2"}},
+		{SHA: "s2", Subject: "Fix logout (#13)", Parents: []string{"s1"}},
+		{SHA: "s3", Subject: "Merge branch 'main' into staging", Parents: []string{"s2", "m1"}},
+		{SHA: "s4", Subject: "Bump the version", Parents: []string{"s3"}},
+	}
+	prs, others := releaseNotes(commits)
+	if strings.Join(prs, "|") != "- Add login (#12)|- Fix logout (#13)" {
+		t.Errorf("pull requests = %q", prs)
+	}
+	if len(others) != 1 || others[0].Subject != "Bump the version" {
+		t.Errorf("other commits = %+v", others)
+	}
+	title, body := prDraft("staging", "main", &Comparison{Ahead: 6, Commits: commits}, "")
+	if title != "Merge staging into main" || !strings.Contains(body, "## Pull requests") || !strings.Contains(body, "## Other commits\n\n- Bump the version (s4)") {
+		t.Errorf("draft = %q\n%s", title, body)
 	}
 }

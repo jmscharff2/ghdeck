@@ -103,6 +103,26 @@ func currentBranch(root string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// upstreamRepo says which repository a branch is pushed to, from its upstream: owner/name, or "" when it has none on
+// GitHub. A branch pushed to your fork names the fork.
+func upstreamRepo(root, branch string) string {
+	if root == "" || branch == "" {
+		return ""
+	}
+	remote, err := runIn(root, "git", "config", "--get", "branch."+branch+".remote")
+	if err != nil {
+		return ""
+	}
+	url, err := runIn(root, "git", "remote", "get-url", strings.TrimSpace(string(remote)))
+	if err != nil {
+		return ""
+	}
+	if _, slug, ok := parseRemote(string(url)); ok {
+		return slug
+	}
+	return ""
+}
+
 // dirty says the checkout has uncommitted changes, which `gh pr checkout` would carry onto another branch.
 func dirty(root string) bool {
 	out, err := runIn(root, "git", "status", "--porcelain", "--untracked-files=no")
