@@ -359,9 +359,27 @@ func ghQuery(query string, vars map[string]any, v any) error {
 	if err != nil {
 		return err
 	}
-	out, err := gh.send("POST", gh.graphql, body)
-	if err != nil {
-		return err
+	mutation := strings.HasPrefix(strings.TrimSpace(query), "mutation")
+	key := ""
+	var out []byte
+	if !mutation {
+		key = sharedKey(body)
+		out = sharedGet(key)
+	}
+	fresh, asked := out == nil, time.Now()
+	if mutation {
+		sharedClear() // before, too: GitHub may apply it even if the answer never arrives
+	}
+	if fresh {
+		if out, err = gh.send("POST", gh.graphql, body); err != nil {
+			if mutation {
+				sharedClear()
+			}
+			return err
+		}
+	}
+	if mutation {
+		sharedClear()
 	}
 	var resp struct {
 		Data   json.RawMessage `json:"data"`
@@ -387,6 +405,12 @@ func ghQuery(query string, vars map[string]any, v any) error {
 		}
 		return fmt.Errorf("GitHub: %s", clean(e.Message))
 	}
+	if fresh && key != "" {
+		sharedPut(key, out, asked)
+	}
+	if v == nil { // a mutation whose answer nothing reads
+		return nil
+	}
 	return json.Unmarshal(resp.Data, v)
 }
 
@@ -399,7 +423,9 @@ func ghWrite(method, path string, payload, v any) error {
 			return err
 		}
 	}
+	sharedClear() // whatever changes, every deck should see it, even if the answer never arrives
 	out, err := gh.send(method, gh.base+"/"+path, body)
+	sharedClear()
 	if err != nil {
 		return err
 	}

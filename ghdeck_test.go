@@ -1,7 +1,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -348,4 +351,355 @@ func TestReleaseNotes(t *testing.T) {
 	if title != "Merge staging into main" || !strings.Contains(body, "## Pull requests") || !strings.Contains(body, "## Other commits\n\n- Bump the version (s4)") {
 		t.Errorf("draft = %q\n%s", title, body)
 	}
+}
+
+// A resolved thread folds to one line, and t passes it by for the next open one.
+func TestDiffResolvedThreads(t *testing.T) {
+	v := newDiffView(Repo{Slug: "o/r"}, 1, "t")
+	v.drafts = nil
+	v.files = []File{{Path: "a.go", Patch: "@@ -1,3 +1,3 @@\n one\n two\n three"}}
+	v.threads = groupThreads([]ReviewComment{
+		{ID: 10, Path: "a.go", Line: 1, Side: "RIGHT", Body: "done with this"},
+		{ID: 20, Path: "a.go", Line: 3, Side: "RIGHT", Body: "still open"},
+	})
+	v.state = &ReviewState{Threads: map[int64]ThreadState{10: {ID: "T10", Resolved: true}, 20: {ID: "T20"}}, Viewed: map[string]bool{}}
+	out := ""
+	for _, r := range v.rows(100) {
+		out += r.text + "\n"
+	}
+	if !strings.Contains(out, "✓ resolved") || strings.Contains(out, "done with this\n") {
+		t.Errorf("the resolved thread should fold to one line:\n%s", out)
+	}
+	if !strings.Contains(out, "still open") {
+		t.Errorf("the open thread should show:\n%s", out)
+	}
+	v.seekThread(1)
+	if v.cursor != 3 { // the hunk header is line 0; "three" is 3
+		t.Errorf("t went to line %d, want the open thread on 3", v.cursor)
+	}
+}
+
+// Side by side, a removed line faces the line that replaced it, and context faces itself.
+func TestSplitRows(t *testing.T) {
+	v := newDiffView(Repo{Slug: "o/r"}, 1, "t")
+	v.drafts = nil
+	v.files = []File{{Path: "main.go", Patch: "@@ -1,3 +1,4 @@\n package main\n-func old() {}\n+func new() {}\n+func more() {}\n // end"}}
+	v.split = true
+	rows := v.rows(140)
+	var code []string
+	for _, r := range rows {
+		if r.code {
+			code = append(code, r.text)
+		}
+	}
+	if len(code) != 5 { // header, context, the changed pair, the extra added line, context
+		t.Fatalf("got %d code rows:\n%s", len(code), strings.Join(code, "\n"))
+	}
+	if !strings.Contains(code[2], "func old()") || !strings.Contains(code[2], "func new()") {
+		t.Errorf("old and new should face each other: %q", code[2])
+	}
+	if strings.Count(code[1], "package main") != 2 {
+		t.Errorf("context should show on both sides: %q", code[1])
+	}
+	for _, r := range rows {
+		if w := lipgloss.Width(r.text); w > 140 {
+			t.Errorf("row is %d wide, over 140: %q", w, r.text)
+		}
+	}
+	if !rows[2].has(2) || !rows[2].has(3) {
+		t.Errorf("the pair's row should hold both lines: %+v", rows[2])
+	}
+}
+
+func TestParseTarget(t *testing.T) {
+	for in, want := range map[string]target{
+		"482":                           {number: 482},
+		"#482":                          {number: 482},
+		"cli/cli#12":                    {repo: "cli/cli", number: 12},
+		"https://github.com/o/r/pull/7": {repo: "o/r", number: 7},
+		"https://github.com/o/r/pull/7/files#diff-abc":    {repo: "o/r", number: 7, files: true},
+		"https://github.com/o/r/issues/9":                 {repo: "o/r", number: 9},
+		"https://github.com/o/r/actions/runs/123/job/456": {repo: "o/r", run: 123},
+	} {
+		if got, ok := parseTarget(in); !ok || got != want {
+			t.Errorf("parseTarget(%q) = %+v %v, want %+v", in, got, ok, want)
+		}
+	}
+	for _, bad := range []string{"", "abc", "foo/bar123", "http://github.com/o/r/pull/7", "https://evil.example/o/r/pull/7", "https://github.com/o/r"} {
+		if _, ok := parseTarget(bad); ok {
+			t.Errorf("parseTarget(%q) should refuse", bad)
+		}
+	}
+}
+
+func TestSplitRowsOldNumbers(t *testing.T) {
+	v := newDiffView(Repo{Slug: "o/r"}, 1, "t")
+	v.drafts = nil
+	v.files = []File{{Path: "x.txt", Patch: "@@ -9,2 +9,3 @@\n a\n+b\n c"}}
+	v.split = true
+	rows := v.rows(140)
+	last := rows[len(rows)-1].text // c: line 10 before, 11 after
+	if !strings.Contains(last, "  10 ") || !strings.Contains(last, "  11 ") {
+		t.Errorf("context should carry its old number on the left and new on the right: %q", last)
+	}
+}
+
+func TestApplySuggestion(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/a.go", []byte("one\ntwo\nthree\nfour\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	body := "Simpler:\n```suggestion\n2 and 3\n```\nWhat do you think?"
+	if got, ok := suggestionIn(body); !ok || len(got) != 1 || got[0] != "2 and 3" {
+		t.Fatalf("suggestionIn = %q %v", got, ok)
+	}
+	if err := applySuggestion(dir, "a.go", 2, 3, []string{"two", "three"}, body); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(dir + "/a.go"); string(b) != "one\n2 and 3\nfour\n" {
+		t.Errorf("file = %q", b)
+	}
+	if err := applySuggestion(dir, "a.go", 1, 1, []string{"not what it says"}, body); err == nil {
+		t.Error("lines that no longer read as the diff should be refused")
+	}
+	if err := applySuggestion(dir, "../outside.go", 1, 1, []string{"x"}, body); err == nil {
+		t.Error("a path outside the checkout should be refused")
+	}
+	if err := applySuggestion(dir, "a.go", 2, 9, nil, body); err == nil {
+		t.Error("lines past the end should be refused")
+	}
+	// A pull request can add a symlink pointing anywhere; writing through it would edit that file.
+	outside := t.TempDir() + "/rc"
+	os.WriteFile(outside, []byte("keep\n"), 0o644)
+	os.Symlink(outside, dir+"/link")
+	if err := applySuggestion(dir, "link", 1, 1, []string{"keep"}, body); err == nil {
+		t.Error("a symlink should be refused")
+	}
+	os.Symlink(filepath.Dir(outside), dir+"/sub")
+	if err := applySuggestion(dir, "sub/rc", 1, 1, []string{"keep"}, body); err == nil {
+		t.Error("a path through a symlinked directory should be refused")
+	}
+	if b, _ := os.ReadFile(outside); string(b) != "keep\n" {
+		t.Errorf("the file outside was changed: %q", b)
+	}
+	if _, ok := suggestionIn("no suggestion here\n```go\nx\n```"); ok {
+		t.Error("an ordinary code block is not a suggestion")
+	}
+}
+
+// Space ticks, typing filters, and enter hands over what is ticked, in the order offered.
+func TestMultiPicker(t *testing.T) {
+	var got []string
+	p := newMultiPicker("Labels", []string{"bug"}, func(ticked []string) tea.Cmd { got = ticked; return nil })
+	p.Update(pickerLoadedMsg{id: p.id, opts: []option{{label: "bug"}, {label: "docs"}, {label: "release", on: true}}})
+	for _, r := range "doc" {
+		p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	p.Update(tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}})
+	p.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if strings.Join(got, ",") != "bug,docs,release" {
+		t.Errorf("ticked = %q", got)
+	}
+}
+
+func TestMergedBranches(t *testing.T) {
+	info := BranchInfo{Default: "main",
+		Branches: []Branch{{Name: "done", SHA: "aaa"}, {Name: "pushed-since", SHA: "new"}, {Name: "main", SHA: "m"}, {Name: "staging", SHA: "s"}},
+		Recent: []RecentPR{
+			{Number: 3, Head: "done", Base: "main", Merged: true, HeadSHA: "aaa"},
+			{Number: 2, Head: "pushed-since", Base: "main", Merged: true, HeadSHA: "old"},
+			{Number: 1, Head: "staging", Base: "main", Merged: true, HeadSHA: "s"}, // long-lived: never done with
+		}}
+	got := mergedBranches(info)
+	if len(got) != 1 || got["done"] != 3 {
+		t.Errorf("merged = %v, want only done (#3)", got)
+	}
+	if plural(2, "branch") != "2 branches" || plural(2, "file") != "2 files" {
+		t.Error("plural")
+	}
+}
+
+// A pull request handed to an agent: its push and how its checks end are news; the same state again is not.
+func TestAnnounceWatched(t *testing.T) {
+	t.Setenv("HERDR_ENV", "") // no real notifications from a test
+	t.Setenv("HERDR_PANE_ID", "")
+	m := newModel(Repo{Slug: "o/r"})
+	m.watching = map[int]*watch{7: {sha: "aaa", checks: "FAILURE"}}
+	said := func(s Status) []string {
+		cmd := m.announceWatched(s)
+		if cmd == nil {
+			return nil
+		}
+		var out []string
+		var run func(tea.Msg)
+		run = func(msg tea.Msg) {
+			switch msg := msg.(type) {
+			case tea.BatchMsg:
+				for _, c := range msg {
+					if c != nil {
+						run(c())
+					}
+				}
+			case actionMsg:
+				out = append(out, msg.text)
+			}
+		}
+		run(cmd())
+		return out
+	}
+	open := func(sha, checks string) Status {
+		return Status{Watched: map[int]Item{7: {Number: 7, Title: "Fix", State: "OPEN", HeadSHA: sha, Checks: checks}}}
+	}
+	if got := said(open("bbb", "PENDING")); len(got) != 1 || !strings.HasPrefix(got[0], "Agent pushed") {
+		t.Errorf("a push: %q", got)
+	}
+	if got := said(open("bbb", "PENDING")); len(got) != 0 {
+		t.Errorf("nothing new: %q", got)
+	}
+	if got := said(open("bbb", "SUCCESS")); len(got) != 1 || !strings.HasPrefix(got[0], "Checks passed") {
+		t.Errorf("checks passing: %q", got)
+	}
+	closed := Status{Watched: map[int]Item{7: {Number: 7, State: "MERGED"}}}
+	if got := said(closed); len(got) != 1 || len(m.watching) != 0 {
+		t.Errorf("a merged pull request stops being watched: %q, %d left", got, len(m.watching))
+	}
+}
+
+// One deck's answer serves another while fresh; a stale one, or any after a write, does not.
+func TestSharedAnswers(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", "")
+	gh.mu.Lock()
+	gh.token = "token-a"
+	gh.mu.Unlock()
+	key := sharedKey([]byte(`{"query":"q"}`))
+	sharedPut(key, []byte(`{"data":{}}`), time.Now())
+	if string(sharedGet(key)) != `{"data":{}}` {
+		t.Fatal("a fresh answer should be shared")
+	}
+	gh.mu.Lock()
+	gh.token = "token-b"
+	gh.mu.Unlock()
+	if sharedKey([]byte(`{"query":"q"}`)) == key {
+		t.Error("another account must not share the answer")
+	}
+	old := time.Now().Add(-time.Minute)
+	if err := os.Chtimes(filepath.Join(sharedDir(), key), old, old); err != nil {
+		t.Fatal(err)
+	}
+	if sharedGet(key) != nil {
+		t.Error("a stale answer should not be shared")
+	}
+	sharedPut(key, []byte(`{"data":{}}`), time.Now())
+	sharedClear()
+	if sharedGet(key) != nil {
+		t.Error("a write should clear the shared answers")
+	}
+	// A question asked before a write, answered after it, may describe the world before: not kept.
+	asked := time.Now().Add(-time.Second)
+	sharedPut(key, []byte(`{"data":{}}`), asked)
+	if sharedGet(key) != nil {
+		t.Error("an answer to a question asked before the last clear should not be shared")
+	}
+	time.Sleep(10 * time.Millisecond)
+	sharedPut(key, []byte(`{"data":{}}`), time.Now())
+	if sharedGet(key) == nil {
+		t.Fatal("an answer asked for after the clear should be shared")
+	}
+	sharedRefresh()
+	if sharedGet(key) != nil {
+		t.Error("a refresh you ask for should go to GitHub")
+	}
+	freshFrom.Store(0)
+	gh.mu.Lock()
+	gh.token = ""
+	gh.mu.Unlock()
+}
+
+func TestSidebarText(t *testing.T) {
+	for want, it := range map[string]Item{
+		"#1 ✗ checks":   {Number: 1, Checks: "FAILURE", Review: "APPROVED"}, // failing outranks approval
+		"#2 ✓ approved": {Number: 2, Checks: "SUCCESS", Review: "APPROVED"},
+		"#3 draft":      {Number: 3, Draft: true, Checks: "FAILURE"},
+		"#4 ◐ checks":   {Number: 4, Checks: "PENDING"},
+	} {
+		if got := sidebarText(it); got != want {
+			t.Errorf("sidebarText = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestInboxTab(t *testing.T) {
+	m := newModel(Repo{Slug: "me/app", Root: "/src/app"})
+	m.tab = tabInbox
+	m.panels[kInbox] = &panel{val: []Notification{
+		{ID: "1", Repo: "other/lib", Kind: "PullRequest", Number: 9, Title: "Fix", Reason: "review_requested", Unread: true},
+		{ID: "2", Repo: "Me/App", Kind: "Issue", Number: 3, Title: "Bug", Reason: "mention"},
+	}}
+	m.w, m.h = 120, 30
+	if n, r, ok := m.inboxSelected(); !ok || n.Number != 9 || r.Root != "" || r.Slug != "other/lib" {
+		t.Errorf("another repository's notification opens there, without this checkout: %+v %+v", n, r)
+	}
+	m.sel[tabInbox] = 1
+	if _, r, _ := m.inboxSelected(); r.Root != "/src/app" {
+		t.Errorf("this repository's notification keeps the checkout: %+v", r)
+	}
+	if _, ok := m.selected(); ok {
+		t.Error("the inbox has no selected item for the repository's own keys")
+	}
+	out := m.View()
+	for _, want := range []string{"4 Inbox 1", "other/lib", "review", "#9 Fix"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("inbox lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+// A worktree is right when it holds the pull request's head, its own commits on top allowed; a half-made one is not.
+func TestWorktreeScript(t *testing.T) {
+	dir := t.TempDir()
+	bin := t.TempDir()
+	os.WriteFile(bin+"/gh", []byte("#!/bin/sh\necho gh was asked >&2\nexit 1\n"), 0o755) // never the network
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	git := func(args ...string) string {
+		out, err := runIn(dir+"/repo", "git", args...)
+		if err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	os.MkdirAll(dir+"/repo", 0o755)
+	git("init", "-q")
+	git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "one")
+	head := git("rev-parse", "HEAD")
+	path := dir + "/repo-pr-1"
+	if _, err := runIn(dir+"/repo", "sh", "-c", worktreeScript(path, 1, "o/r", head)); err != nil {
+		t.Fatalf("a worktree at the head needs no checkout: %v", err)
+	}
+	runIn(path, "git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "agent's")
+	if _, err := runIn(dir+"/repo", "sh", "-c", worktreeScript(path, 1, "o/r", head)); err != nil {
+		t.Errorf("the agent's own commits on top are fine: %v", err)
+	}
+	if _, err := runIn(dir+"/repo", "sh", "-c", worktreeScript(path, 1, "o/r", strings.Repeat("a", 40))); err == nil {
+		t.Error("a worktree not on the head, where checkout fails, should be an error")
+	}
+}
+
+// The labels picker never drops a label it did not offer, nor applies anything before its choices load.
+func TestMultiPickerKeepsWhatItDidNotOffer(t *testing.T) {
+	var got []string
+	called := false
+	p := newMultiPicker("Labels", []string{"bug", "zz-old"}, func(ticked []string) tea.Cmd { called, got = true, ticked; return nil })
+	p.loading = true
+	if open, _ := p.Update(tea.KeyMsg{Type: tea.KeyEnter}); !open || called {
+		t.Fatal("enter while loading should do nothing")
+	}
+	p.Update(pickerLoadedMsg{id: p.id, opts: []option{{label: "bug"}, {label: "docs"}}}) // zz-old is past the first hundred
+	p.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if strings.Join(got, ",") != "bug,zz-old" {
+		t.Errorf("ticked = %q, want bug and the unlisted zz-old kept", got)
+	}
+	failed := newMultiPicker("Labels", []string{"bug"}, func([]string) tea.Cmd { t.Error("applied after a failed load"); return nil })
+	failed.Update(pickerLoadedMsg{id: failed.id, err: errors.New("rate limited")})
+	failed.Update(tea.KeyMsg{Type: tea.KeyEnter})
 }
