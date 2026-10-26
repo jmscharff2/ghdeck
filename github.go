@@ -1280,6 +1280,7 @@ type Reviewer struct {
 	Team      bool
 	Requested bool   // asked already
 	Why       string // GitHub's reason to suggest them, when it does
+	Reviewed  string // how they last reviewed, for asking again: "approved", "asked for changes", …
 }
 
 // key names a reviewer across users and teams.
@@ -1300,6 +1301,7 @@ func fetchReviewers(repo string, number int) ([]Reviewer, error) {
 				author { login }
 				reviewRequests(first: 50) { nodes { requestedReviewer { __typename ... on User { login name } ... on Team { slug name } } } }
 				suggestedReviewers { isAuthor isCommenter reviewer { login name } }
+				latestReviews(first: 30) { nodes { state author { login } } }
 			}
 			assignableUsers(first: 100) { nodes { login name } }
 		}
@@ -1324,6 +1326,12 @@ func fetchReviewers(repo string, number int) ([]Reviewer, error) {
 					Commenter bool   `json:"isCommenter"`
 					Who       person `json:"reviewer"`
 				} `json:"suggestedReviewers"`
+				Latest struct {
+					Nodes []struct {
+						State  string   `json:"state"`
+						Author gqlLogin `json:"author"`
+					} `json:"nodes"`
+				} `json:"latestReviews"`
 			} `json:"pullRequest"`
 			Assignable struct {
 				Nodes []person `json:"nodes"`
@@ -1353,6 +1361,12 @@ func fetchReviewers(repo string, number int) ([]Reviewer, error) {
 		} else {
 			add(Reviewer{Login: clean(n.Who.Login), Name: clean(n.Who.Name), Requested: true})
 		}
+	}
+	// Those who reviewed already, to ask again after new commits.
+	for _, r := range pr.Latest.Nodes {
+		word := map[string]string{"APPROVED": "approved", "CHANGES_REQUESTED": "asked for changes", "COMMENTED": "commented",
+			"DISMISSED": "review dismissed"}[r.State]
+		add(Reviewer{Login: clean(r.Author.Login), Reviewed: or(word, "reviewed")})
 	}
 	for _, s := range pr.Suggested {
 		why := "changed this code before"

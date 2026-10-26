@@ -194,7 +194,7 @@ func (m *model) announceWatched(s Status) tea.Cmd {
 		}
 		pushed := it.HeadSHA != "" && w.sha != "" && it.HeadSHA != w.sha
 		if pushed {
-			cmds = append(cmds, notify("Agent pushed", fmt.Sprintf("%s · %s · checks running", what, short(it.HeadSHA)), false))
+			cmds = append(cmds, notify("Agent pushed", fmt.Sprintf("%s · %s · checks running · R asks reviewers again", what, short(it.HeadSHA)), false))
 		}
 		// How the checks ended, once for each commit: news when they change, or when there is a new commit.
 		switch {

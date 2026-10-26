@@ -509,6 +509,9 @@ func reviewersPicker(repo string, number int) *picker {
 			if r.Why != "" {
 				detail = strings.TrimPrefix(detail+" · ", " · ") + sGood.Render("suggested: "+r.Why)
 			}
+			if r.Reviewed != "" {
+				detail = strings.TrimPrefix(detail+" · ", " · ") + sWarn.Render(r.Reviewed+" · tick to ask again")
+			}
 			opts = append(opts, option{label: label, match: r.key(), detail: detail, on: r.Requested})
 		}
 		return opts, nil
@@ -538,7 +541,7 @@ func reviewersPicker(repo string, number int) *picker {
 			for _, r := range add {
 				names = append(names, r.Login)
 			}
-			text := "asked " + strings.Join(names, ", ")
+			text := "asked " + strings.Join(names, ", ") + " to review"
 			if len(add) == 0 {
 				text = fmt.Sprintf("stopped asking %s", plural(len(remove), "reviewer"))
 			}

@@ -181,7 +181,8 @@ a header for each step.
 | `D` | convert to draft, or mark ready for review |
 | `x` | close or reopen (type `yes`) |
 | `A` | assign yourself |
-| `R` | reviewers: GitHub's suggestions first, teams, and anyone who can be assigned (space ticks, typing filters) |
+| `R` | reviewers: GitHub's suggestions first, then those who reviewed already, to ask again after new commits, teams, and anyone who can be assigned (space ticks, typing filters) |
+| `u` | update the branch from its base: merge the base in, or rebase onto it (asks first) |
 | `L` | labels |
 | `C` `W` | check out here, or in a worktree |
 | `w` | work on it with an agent in its own worktree (Herdr) |
