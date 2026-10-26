@@ -273,6 +273,7 @@ What it does not protect against: anything that already runs as you. A program t
 ```bash
 go test ./...
 GHDECK_LIVE=1 go test -run TestLive .    # reads a public repo through the real API
+GHDECK_WRITE=you/scratch go test -run TestWrites -v .   # every write, on a throwaway pull request it closes
 go build -o ghdeck . && ./ghdeck -R owner/name
 ```
 
