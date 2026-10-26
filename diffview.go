@@ -77,9 +77,19 @@ type diffDataMsg struct {
 	id       int
 	files    []File
 	comments []ReviewComment
+	state    *ReviewState
 	sha      string
 	err      error
 }
+
+// sinceMsg brings what changed since your last review, for S.
+type sinceMsg struct {
+	id    int
+	files []File
+	err   error
+}
+
+func (m sinceMsg) viewID() int { return m.id }
 
 func (m diffDataMsg) viewID() int { return m.id }
 
@@ -94,8 +104,13 @@ type diffView struct {
 	files   []File
 	threads map[string][]thread // by path, then found by anchor
 	drafts  []DraftComment
+	state   *ReviewState // thread ids and resolution, files viewed, your last review; nil until loaded
 	loading bool
 	err     error
+
+	// since shows only what changed since your last review (S); all keeps the whole pull request meanwhile.
+	since bool
+	all   []File
 
 	file   int
 	cursor int // index into the file's lines
@@ -133,7 +148,11 @@ func (v *diffView) fetch() tea.Cmd {
 			return diffDataMsg{id: id, err: err}
 		}
 		comments, err := fetchReviewComments(repo, n)
-		return diffDataMsg{id: id, files: files, comments: comments, sha: clean(pr.Head.SHA), err: err}
+		if err != nil {
+			return diffDataMsg{id: id, err: err}
+		}
+		state, err := fetchReviewState(repo, n)
+		return diffDataMsg{id: id, files: files, comments: comments, state: state, sha: clean(pr.Head.SHA), err: err}
 	}
 }
 
@@ -158,15 +177,31 @@ func (v *diffView) Update(msg tea.Msg) (bool, tea.Cmd) {
 		} else {
 			v.err = nil
 		}
+		if msg.state != nil {
+			v.state = msg.state
+		}
 		if msg.files != nil {
-			changed := len(msg.files) != len(v.files) || msg.sha != v.sha
-			v.files, v.sha = msg.files, msg.sha
-			if changed {
-				v.parsed = map[int][]diffLine{}
-				v.file, v.cursor, v.scroll = min(v.file, max(0, len(v.files)-1)), 0, 0
+			if v.since { // keep showing what changed since the review; the whole is for when S goes back
+				v.all, v.sha = msg.files, msg.sha
+			} else {
+				changed := len(msg.files) != len(v.files) || msg.sha != v.sha
+				v.files, v.sha = msg.files, msg.sha
+				if changed {
+					v.parsed = map[int][]diffLine{}
+					v.file, v.cursor, v.scroll = min(v.file, max(0, len(v.files)-1)), 0, 0
+				}
 			}
 			v.threads = groupThreads(msg.comments)
 		}
+	case sinceMsg:
+		v.loading = false
+		if msg.err != nil {
+			v.note = "can't compare with your last review: " + errText(msg.err)
+			return true, nil
+		}
+		v.all, v.files, v.since = v.files, msg.files, true
+		v.parsed, v.file, v.cursor, v.scroll = map[int][]diffLine{}, 0, 0, 0
+		v.note = fmt.Sprintf("%d file(s) changed since your last review · S shows everything", len(v.files))
 	case draftDeleteMsg:
 		if msg.index < len(v.drafts) {
 			v.drafts = append(v.drafts[:msg.index:msg.index], v.drafts[msg.index+1:]...)
@@ -236,6 +271,14 @@ func (v *diffView) threadsAt(i int) ([]thread, []int) {
 	return ts, ds
 }
 
+// resolved says whether a thread is resolved, as far as the review state knows.
+func (v *diffView) resolved(t thread) bool {
+	return v.state != nil && v.state.Threads[t.root.ID].Resolved
+}
+
+// viewed says whether you ticked "Viewed" on a file.
+func (v *diffView) viewed(path string) bool { return v.state != nil && v.state.Viewed[path] }
+
 func (v *diffView) outdated() []thread {
 	var ts []thread
 	for _, t := range v.threads[v.path()] {
@@ -296,6 +339,12 @@ func (v *diffView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 		return true, v.fetch()
 	case "o":
 		return true, openURL(fmt.Sprintf("https://github.com/%s/pull/%d/files", v.repo.Slug, v.number))
+	case "z":
+		return true, v.toggleResolved()
+	case "V":
+		return true, v.toggleViewed()
+	case "S":
+		return true, v.toggleSince()
 	case "c":
 		if v.cursor >= len(lines) {
 			return true, nil
@@ -304,6 +353,10 @@ func (v *diffView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 		side, n, ok := l.anchor()
 		if !ok {
 			v.note = "pick a line of code to comment on"
+			return true, nil
+		}
+		if v.since && side == "LEFT" {
+			v.note = "a removed line here is from your last review, not the base · S shows the whole diff to comment on it"
 			return true, nil
 		}
 		path := v.path()
@@ -362,6 +415,106 @@ func (v *diffView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 	return true, nil
 }
 
+// toggleResolved resolves the thread on the cursor's line, or opens it again.
+func (v *diffView) toggleResolved() tea.Cmd {
+	ts, _ := v.threadsAt(v.cursor)
+	if len(ts) == 0 {
+		v.note = "no thread on this line · t finds the next"
+		return nil
+	}
+	t := ts[len(ts)-1]
+	for _, c := range ts { // an open one first
+		if !v.resolved(c) {
+			t = c
+			break
+		}
+	}
+	var ts2 ThreadState
+	ok := false
+	if v.state != nil {
+		ts2, ok = v.state.Threads[t.root.ID]
+	}
+	if !ok {
+		v.note = "GitHub has not said which thread this is yet · r reloads"
+		return nil
+	}
+	resolve := !ts2.Resolved
+	ts2.Resolved = resolve
+	v.state.Threads[t.root.ID] = ts2 // shown at once; the reload after confirms it
+	text := "thread resolved"
+	if !resolve {
+		text = "thread opened again"
+	}
+	return func() tea.Msg {
+		if err := setResolved(ts2.ID, resolve); err != nil {
+			return actionMsg{err: err, refresh: true}
+		}
+		return actionMsg{text: text, refresh: true}
+	}
+}
+
+// toggleViewed ticks the file's "Viewed" box on GitHub, as its own page does, and moves on to the next file not
+// viewed yet.
+func (v *diffView) toggleViewed() tea.Cmd {
+	path := v.path()
+	if path == "" || v.state == nil || v.state.PRID == "" {
+		return nil
+	}
+	viewed := !v.state.Viewed[path]
+	v.state.Viewed[path] = viewed
+	prID := v.state.PRID
+	if viewed {
+		for i := 1; i < len(v.files); i++ {
+			if f := (v.file + i) % len(v.files); !v.viewed(v.files[f].Path) {
+				v.openFile(f)
+				break
+			}
+		}
+	}
+	n := 0
+	for _, f := range v.files {
+		if v.viewed(f.Path) {
+			n++
+		}
+	}
+	text := fmt.Sprintf("viewed · %d of %d files", n, len(v.files))
+	if !viewed {
+		text = "not viewed · " + path
+	}
+	return func() tea.Msg {
+		if err := setViewed(prID, path, viewed); err != nil {
+			return actionMsg{err: err}
+		}
+		return actionMsg{text: text}
+	}
+}
+
+// toggleSince shows only what changed since your last review, or the whole pull request again.
+func (v *diffView) toggleSince() tea.Cmd {
+	if v.since {
+		v.files, v.all, v.since = v.all, nil, false
+		v.parsed, v.file, v.cursor, v.scroll = map[int][]diffLine{}, 0, 0, 0
+		v.note = "the whole pull request"
+		return nil
+	}
+	switch {
+	case v.state == nil:
+		return nil
+	case v.state.LastReview == "":
+		v.note = "you have not reviewed this pull request yet"
+		return nil
+	case v.state.LastReview == v.sha:
+		v.note = "nothing new since your last review"
+		return nil
+	}
+	v.loading = true
+	id, repo, from, to := v.id, v.repo.Slug, v.state.LastReview, v.sha
+	return func() tea.Msg {
+		files, err := fetchFilesSince(repo, from, to)
+		return sinceMsg{id: id, files: files, err: err}
+	}
+}
+
 type draftDeleteMsg struct {
 	id    int
 	index int
@@ -400,16 +553,22 @@ func (v *diffView) seek(dir int, ok func(diffLine, int) bool) int {
 
 // seekThread moves to the next line with a thread or a draft, on to the next file when this one has no more.
 func (v *diffView) seekThread(dir int) {
+	// Resolved threads are done with; t skips them.
 	has := func(_ diffLine, i int) bool {
 		ts, ds := v.threadsAt(i)
-		return len(ts) > 0 || len(ds) > 0
+		for _, t := range ts {
+			if !v.resolved(t) {
+				return true
+			}
+		}
+		return len(ds) > 0
 	}
 	if i := v.seek(dir, has); i != v.cursor {
 		v.cursor = i
 		return
 	}
 	for f := v.file + dir; f >= 0 && f < len(v.files); f += dir {
-		if len(v.threads[v.files[f].Path]) == 0 && !v.hasDrafts(v.files[f].Path) {
+		if v.openThreads(v.files[f].Path) == 0 && !v.hasDrafts(v.files[f].Path) {
 			continue
 		}
 		v.openFile(f)
@@ -427,6 +586,17 @@ func (v *diffView) seekThread(dir int) {
 	v.note = "no more threads"
 }
 
+// openThreads counts a file's unresolved threads.
+func (v *diffView) openThreads(path string) int {
+	n := 0
+	for _, t := range v.threads[path] {
+		if !v.resolved(t) {
+			n++
+		}
+	}
+	return n
+}
+
 func (v *diffView) hasDrafts(path string) bool {
 	for _, d := range v.drafts {
 		if d.Path == path {
@@ -441,9 +611,14 @@ func (v *diffView) filePicker() *picker {
 	for i, f := range v.files {
 		i := i
 		label := fileStatusIcon(f.Status) + " " + f.Path
+		if v.viewed(f.Path) {
+			label = sGood.Render("✓ ") + label
+		} else {
+			label = "  " + label
+		}
 		detail := sGood.Render(fmt.Sprintf("+%d", f.Additions)) + sBad.Render(fmt.Sprintf(" −%d", f.Deletions))
-		if n := len(v.threads[f.Path]); n > 0 {
-			detail += sMuted.Render(fmt.Sprintf(" · %d thread(s)", n))
+		if n := v.openThreads(f.Path); n > 0 {
+			detail += sMuted.Render(fmt.Sprintf(" · %d open thread(s)", n))
 		}
 		if v.hasDrafts(f.Path) {
 			detail += sWarn.Render(" · drafts")
@@ -451,13 +626,14 @@ func (v *diffView) filePicker() *picker {
 		if f.Previous != "" {
 			detail += sMuted.Render(" · from " + f.Previous)
 		}
-		opts = append(opts, option{label: label, detail: detail, run: func() tea.Cmd {
+		opts = append(opts, option{label: label, match: f.Path, detail: detail, run: func() tea.Cmd {
 			v.openFile(i)
 			return nil
 		}})
 	}
 	p := newPicker(fmt.Sprintf("Files in #%d", v.number), opts)
 	p.sel = v.file
+	p.filterable = true
 	return p
 }
 
@@ -579,6 +755,13 @@ func (v *diffView) rows(w int) []row {
 		}
 		ts, ds := v.threadsAt(i)
 		for _, t := range ts {
+			if v.resolved(t) { // folded to a line: done with, but still there
+				first, _, _ := strings.Cut(t.root.Body, "\n")
+				text := fmt.Sprintf("      %s %s · %s", sGood.Render("✓ resolved"), sMuted.Render(t.root.User.Login+": "+first),
+					sMuted.Render(plural(1+len(t.replies), "comment")+" · z opens it"))
+				out = append(out, row{text: truncStyledLine(text, w), line: i})
+				continue
+			}
 			for _, r := range threadRows(t, w) {
 				out = append(out, row{text: r, line: i})
 			}
@@ -605,6 +788,12 @@ func (v *diffView) View(w, h int) string {
 		where := fmt.Sprintf(" file %d/%d ", v.file+1, len(v.files))
 		stats := sGood.Render(fmt.Sprintf("+%d", f.Additions)) + sBad.Render(fmt.Sprintf(" −%d", f.Deletions))
 		line := sMuted.Render(where) + fileStatusIcon(f.Status) + " " + sBold.Render(f.Path) + "  " + stats
+		if v.viewed(f.Path) {
+			line += sGood.Render("  ✓ viewed")
+		}
+		if v.since {
+			line += sWarn.Render("  since your last review")
+		}
 		if n := len(v.drafts); n > 0 {
 			line += sWarn.Render(fmt.Sprintf("  %d draft(s)", n))
 		}
@@ -614,8 +803,9 @@ func (v *diffView) View(w, h int) string {
 	}
 	head = append(head, sRule.Render(strings.Repeat("─", w)))
 
-	keys := [][2]string{{"↑↓", "line"}, {"n p", "file"}, {"f", "files"}, {"t", "next thread"}, {"c", "comment"},
-		{"R", "reply"}, {"v", "send review"}, {"w", "wrap"}, {"esc", "back"}}
+	keys := [][2]string{{"↑↓", "line"}, {"n p", "file"}, {"f", "files"}, {"V", "viewed"}, {"t", "next thread"},
+		{"c", "comment"}, {"R", "reply"}, {"z", "resolve"}, {"S", "since review"}, {"v", "send review"}, {"w", "wrap"},
+		{"esc", "back"}}
 	help := keyHelp(keys, w)
 	bodyH := max(1, h-len(head)-1-lipgloss.Height(help))
 	var body []string

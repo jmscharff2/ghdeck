@@ -155,12 +155,15 @@ a header for each step.
 |---|---|
 | `↑` `↓` `pgup` `pgdn` `g` `G` | move the cursor line |
 | `n` `p` (or `]` `[`) | next, previous file |
-| `f` | every file, with its thread count |
+| `f` | every file, with its open threads and whether you viewed it; typing filters |
+| `V` | mark the file viewed, as GitHub's checkbox does, and go on to the next one you haven't |
+| `S` | only what changed since your last review, or everything again |
 | `{` `}` | previous, next hunk |
-| `t` `T` | next, previous line with a thread or a draft, across files |
+| `t` `T` | next, previous line with an open thread or a draft, across files |
 | `c` | draft a comment on this line |
 | `e` `x` | edit, delete your draft on this line |
 | `R` | reply to the thread on this line (posts at once) |
+| `z` | resolve the thread on this line, or open it again; resolved threads fold to a line |
 | `v` | send the review |
 | `w` | wrap long lines on or off |
 | `o` | the files on GitHub |

@@ -349,3 +349,29 @@ func TestReleaseNotes(t *testing.T) {
 		t.Errorf("draft = %q\n%s", title, body)
 	}
 }
+
+// A resolved thread folds to one line, and t passes it by for the next open one.
+func TestDiffResolvedThreads(t *testing.T) {
+	v := newDiffView(Repo{Slug: "o/r"}, 1, "t")
+	v.drafts = nil
+	v.files = []File{{Path: "a.go", Patch: "@@ -1,3 +1,3 @@\n one\n two\n three"}}
+	v.threads = groupThreads([]ReviewComment{
+		{ID: 10, Path: "a.go", Line: 1, Side: "RIGHT", Body: "done with this"},
+		{ID: 20, Path: "a.go", Line: 3, Side: "RIGHT", Body: "still open"},
+	})
+	v.state = &ReviewState{Threads: map[int64]ThreadState{10: {ID: "T10", Resolved: true}, 20: {ID: "T20"}}, Viewed: map[string]bool{}}
+	out := ""
+	for _, r := range v.rows(100) {
+		out += r.text + "\n"
+	}
+	if !strings.Contains(out, "✓ resolved") || strings.Contains(out, "done with this\n") {
+		t.Errorf("the resolved thread should fold to one line:\n%s", out)
+	}
+	if !strings.Contains(out, "still open") {
+		t.Errorf("the open thread should show:\n%s", out)
+	}
+	v.seekThread(1)
+	if v.cursor != 3 { // the hunk header is line 0; "three" is 3
+		t.Errorf("t went to line %d, want the open thread on 3", v.cursor)
+	}
+}

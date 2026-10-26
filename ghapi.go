@@ -387,6 +387,9 @@ func ghQuery(query string, vars map[string]any, v any) error {
 		}
 		return fmt.Errorf("GitHub: %s", clean(e.Message))
 	}
+	if v == nil { // a mutation whose answer nothing reads
+		return nil
+	}
 	return json.Unmarshal(resp.Data, v)
 }
 

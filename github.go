@@ -623,6 +623,7 @@ type ReviewComment struct {
 	Created   time.Time `json:"created_at"`
 	User      gqlLogin  `json:"user"`
 	CommitID  string    `json:"commit_id"`
+	StartLine int       `json:"start_line"` // the first line of a comment on several, else 0
 	Outdated  bool      `json:"-"`
 	Pending   bool      `json:"-"` // a draft of yours, not yet sent
 	DraftSide string    `json:"-"`
@@ -1009,4 +1010,133 @@ func createPR(repo, base, head, title, body string, draft bool) (Item, error) {
 	}
 	return Item{Number: resp.Number, Title: clean(resp.Title), URL: clean(resp.URL), IsPR: true, State: "OPEN",
 		Draft: draft, Head: head, Base: base}, nil
+}
+
+// ---- review state ----
+
+// ReviewState is what the diff needs beyond REST: each thread's node id and whether it is resolved, keyed by its first
+// comment's id; the files you have marked viewed; and the commit your last review was on.
+type ReviewState struct {
+	PRID       string
+	Threads    map[int64]ThreadState
+	Viewed     map[string]bool
+	LastReview string // the head commit when you last reviewed, or ""
+}
+
+type ThreadState struct {
+	ID       string
+	Resolved bool
+}
+
+// fetchReviewState reads it in one query, paging the files a hundred at a time.
+func fetchReviewState(repo string, number int) (*ReviewState, error) {
+	owner, name, _ := strings.Cut(repo, "/")
+	q := `query($o: String!, $n: String!, $num: Int!, $after: String) {
+		repository(owner: $o, name: $n) {
+			pullRequest(number: $num) {
+				id
+				viewerLatestReview { commit { oid } }
+				files(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { path viewerViewedState } }
+				reviewThreads(first: 100) { nodes { id isResolved comments(first: 1) { nodes { databaseId } } } }
+			}
+		}
+	}`
+	st := &ReviewState{Threads: map[int64]ThreadState{}, Viewed: map[string]bool{}}
+	var after *string
+	for page := 0; page < 30; page++ {
+		var resp struct {
+			Repository *struct {
+				PR *struct {
+					ID     string `json:"id"`
+					Latest *struct {
+						Commit *struct {
+							OID string `json:"oid"`
+						} `json:"commit"`
+					} `json:"viewerLatestReview"`
+					Files struct {
+						PageInfo struct {
+							Next   bool   `json:"hasNextPage"`
+							Cursor string `json:"endCursor"`
+						} `json:"pageInfo"`
+						Nodes []struct {
+							Path   string `json:"path"`
+							Viewed string `json:"viewerViewedState"`
+						} `json:"nodes"`
+					} `json:"files"`
+					Threads struct {
+						Nodes []struct {
+							ID       string `json:"id"`
+							Resolved bool   `json:"isResolved"`
+							Comments struct {
+								Nodes []struct {
+									DatabaseID int64 `json:"databaseId"`
+								} `json:"nodes"`
+							} `json:"comments"`
+						} `json:"nodes"`
+					} `json:"reviewThreads"`
+				} `json:"pullRequest"`
+			} `json:"repository"`
+		}
+		if err := ghQuery(q, map[string]any{"o": owner, "n": name, "num": number, "after": after}, &resp); err != nil {
+			return nil, err
+		}
+		if resp.Repository == nil || resp.Repository.PR == nil {
+			return nil, fmt.Errorf("GitHub has no pull request #%d in %s", number, repo)
+		}
+		pr := resp.Repository.PR
+		st.PRID = pr.ID
+		if pr.Latest != nil && pr.Latest.Commit != nil {
+			st.LastReview = clean(pr.Latest.Commit.OID)
+		}
+		for _, f := range pr.Files.Nodes {
+			st.Viewed[clean(f.Path)] = f.Viewed == "VIEWED"
+		}
+		if page == 0 {
+			for _, t := range pr.Threads.Nodes {
+				if len(t.Comments.Nodes) > 0 {
+					st.Threads[t.Comments.Nodes[0].DatabaseID] = ThreadState{ID: t.ID, Resolved: t.Resolved}
+				}
+			}
+		}
+		if !pr.Files.PageInfo.Next {
+			break
+		}
+		c := pr.Files.PageInfo.Cursor
+		after = &c
+	}
+	return st, nil
+}
+
+// setResolved resolves a review thread, or opens it again.
+func setResolved(threadID string, resolved bool) error {
+	m := "unresolveReviewThread"
+	if resolved {
+		m = "resolveReviewThread"
+	}
+	return ghQuery(`mutation($id: ID!) { `+m+`(input: {threadId: $id}) { thread { id } } }`, map[string]any{"id": threadID}, nil)
+}
+
+// setViewed ticks a file's "Viewed" box on GitHub, or clears it.
+func setViewed(prID, path string, viewed bool) error {
+	m := "unmarkFileAsViewed"
+	if viewed {
+		m = "markFileAsViewed"
+	}
+	return ghQuery(`mutation($id: ID!, $path: String!) { `+m+`(input: {pullRequestId: $id, path: $path}) { clientMutationId } }`,
+		map[string]any{"id": prID, "path": path}, nil)
+}
+
+// fetchFilesSince is what changed between two commits, as files with patches: a pull request since you reviewed it.
+func fetchFilesSince(repo, from, to string) ([]File, error) {
+	var resp struct {
+		Files []File `json:"files"`
+	}
+	if err := ghGet(fmt.Sprintf("repos/%s/compare/%s...%s", repo, from, to), &resp); err != nil {
+		return nil, err
+	}
+	for i := range resp.Files {
+		f := &resp.Files[i]
+		f.Path, f.Previous, f.Status, f.Patch = clean(f.Path), clean(f.Previous), clean(f.Status), cleanKeepTabsLines(f.Patch)
+	}
+	return resp.Files, nil
 }
