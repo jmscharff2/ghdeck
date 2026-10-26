@@ -41,7 +41,7 @@ to a pull request, issue or Actions run; a pull request's `/files` link opens it
 herdr plugin install jmscharff2/ghdeck      # builds it with Go; needs Herdr 0.9.3 or later
 ```
 
-This adds three actions to Herdr, each for the repository in the pane you are working in:
+This adds actions to Herdr, each for the repository in the pane you are working in, and a handler for GitHub links:
 
 - **ghdeck: open beside this pane**
 - **ghdeck: open in a new tab**
@@ -68,6 +68,10 @@ command = "ghdeck.open"
 ```
 
 Inside Herdr, ghdeck also:
+
+- **opens GitHub links you ctrl+click** in any pane, an agent's output say: a pull request, its files, an issue, or an
+  Actions run opens in ghdeck over that pane, and `q` puts you back. (Herdr routes clicks to plugins while
+  `ui.mouse_capture` is on.)
 
 - **opens interactive commands in a pane below** (`gh issue create`, `gh pr create` for a branch not pushed yet,
   checking a branch out, signing in). Outside Herdr they borrow the terminal until they exit.
