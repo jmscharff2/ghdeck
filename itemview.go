@@ -154,6 +154,30 @@ func (v *itemView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 		if it.IsPR && v.d != nil && it.State == "OPEN" {
 			return true, pushView(v.mergePicker())
 		}
+	case "e":
+		if v.d == nil || !v.d.CanEdit {
+			return true, nil
+		}
+		d := v.d
+		what := "issue"
+		if it.IsPR {
+			what = "pull request"
+		}
+		c := newComposer(fmt.Sprintf("Edit #%d", d.Number), []string{sMuted.Render("The first line is the title; the rest is the description.")},
+			d.Title+"\n\n"+d.Body)
+		c.send = func(text string) error {
+			t, b, _ := strings.Cut(text, "\n")
+			if t = strings.TrimSpace(t); t == "" {
+				return fmt.Errorf("the first line is the title: write one")
+			}
+			return editItem(d.ID, d.IsPR, t, strings.TrimSpace(b))
+		}
+		c.done = func(string) tea.Cmd { return v.after(what + " updated") }
+		return true, pushView(c)
+	case "E":
+		if v.d != nil {
+			return true, pushView(v.commentsPicker())
+		}
 	case "u":
 		if it.IsPR && v.d != nil && it.State == "OPEN" {
 			return true, pushView(v.updatePicker())
@@ -247,6 +271,50 @@ func (v *itemView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 // after reports an action done and reloads this view.
 func (v *itemView) after(text string) tea.Cmd {
 	return tea.Batch(func() tea.Msg { return actionMsg{text: text} }, v.fetch())
+}
+
+// commentsPicker lists your comments in the conversation, to edit or delete one.
+func (v *itemView) commentsPicker() *picker {
+	var opts []option
+	for i := len(v.d.Events) - 1; i >= 0; i-- { // the newest first
+		e := v.d.Events[i]
+		if e.Kind != "comment" || !e.CanEdit && !e.CanDelete {
+			continue
+		}
+		first, _, _ := strings.Cut(e.Body, "\n")
+		opts = append(opts, option{label: truncate(first, 70), detail: age(e.At) + " ago", run: func() tea.Cmd { return pushView(v.commentPicker(e)) }})
+	}
+	p := newPicker(fmt.Sprintf("Your comments on #%d", v.d.Number), opts)
+	if len(opts) == 0 {
+		p.note = func(int) []string { return []string{sMuted.Render(" You have no comments here to change.")} }
+	}
+	return p
+}
+
+// commentPicker edits or deletes one comment.
+func (v *itemView) commentPicker(e Event) *picker {
+	var opts []option
+	if e.CanEdit {
+		opts = append(opts, option{label: "Edit", run: func() tea.Cmd {
+			c := newComposer("Edit your comment", nil, e.Body)
+			c.send = func(body string) error { return editComment(e.ID, body) }
+			c.done = func(string) tea.Cmd { return v.after("comment updated") }
+			return pushView(c)
+		}})
+	}
+	if e.CanDelete {
+		opts = append(opts, option{label: "Delete", detail: "asks first", run: func() tea.Cmd {
+			v.ask = newConfirmation("Delete your comment?", func() tea.Msg {
+				if err := deleteComment(e.ID); err != nil {
+					return actionMsg{err: err}
+				}
+				return actionMsg{text: "comment deleted", refresh: true}
+			})
+			return nil
+		}})
+	}
+	first, _, _ := strings.Cut(e.Body, "\n")
+	return newPicker("Your comment: "+truncate(first, 50), opts)
 }
 
 // updatePicker brings the base branch's new commits into the pull request's branch, by merging or by rebasing.
@@ -696,6 +764,10 @@ func (v *itemView) footer(w int) string {
 		keys = append(keys, [2]string{"A", "assign me"})
 	}
 	keys = append(keys, [2]string{"L", "labels"})
+	if v.d != nil && v.d.CanEdit {
+		keys = append(keys, [2]string{"e", "edit"})
+	}
+	keys = append(keys, [2]string{"E", "your comments"})
 	if it.State != "MERGED" {
 		word := "close"
 		if it.State == "CLOSED" {

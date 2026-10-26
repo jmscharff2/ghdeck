@@ -401,9 +401,13 @@ func (v *diffView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 		}
 		return true, pushView(c)
 	case "e", "x":
-		_, ds := v.threadsAt(v.cursor)
+		ts, ds := v.threadsAt(v.cursor)
 		if len(ds) == 0 {
-			v.note = "no draft of yours on this line"
+			// No draft here: your comment already posted on this line, if there is one.
+			if c := v.yourComment(ts); c != nil {
+				return true, v.changePosted(*c, msg.String() == "x")
+			}
+			v.note = "no draft or comment of yours on this line"
 			return true, nil
 		}
 		j := ds[len(ds)-1]
@@ -447,6 +451,43 @@ func (v *diffView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 		}))
 	}
 	return true, nil
+}
+
+// yourComment finds your latest posted comment among a line's threads.
+func (v *diffView) yourComment(ts []thread) *ReviewComment {
+	if v.state == nil || v.state.Viewer == "" {
+		return nil
+	}
+	var found *ReviewComment
+	for _, t := range ts {
+		for _, c := range append([]ReviewComment{t.root}, t.replies...) {
+			if c.User.Login == v.state.Viewer && (found == nil || c.Created.After(found.Created)) {
+				c := c
+				found = &c
+			}
+		}
+	}
+	return found
+}
+
+// changePosted edits, or after asking deletes, a comment of yours already on GitHub.
+func (v *diffView) changePosted(c ReviewComment, del bool) tea.Cmd {
+	repo := v.repo.Slug
+	if del {
+		v.ask = newConfirmation("Delete your posted comment?", func() tea.Msg {
+			if err := deleteReviewComment(repo, c.ID); err != nil {
+				return actionMsg{err: err}
+			}
+			return actionMsg{text: "comment deleted", refresh: true}
+		})
+		return nil
+	}
+	comp := newComposer(fmt.Sprintf("Edit your comment on %s:%d", c.Path, c.Line), nil, c.Body)
+	comp.send = func(body string) error { return editReviewComment(repo, c.ID, body) }
+	comp.done = func(string) tea.Cmd {
+		return tea.Batch(func() tea.Msg { return actionMsg{text: "comment updated"} }, v.fetch())
+	}
+	return pushView(comp)
 }
 
 // suggestionIn reads the lines a comment suggests, from its first suggestion block.

@@ -175,6 +175,8 @@ a header for each step.
 |---|---|
 | `↑` `↓` `pgup` `pgdn` `g` `G` | scroll |
 | `c` | comment |
+| `e` | edit the title and description (the first line is the title) |
+| `E` | your comments in the conversation, to edit or delete |
 | `d` `s` | the diff, every check (enter on an Actions check opens its run) |
 | `v` | review: comment, approve or request changes, with the diff's drafted line comments |
 | `m` | merge, by any method the repo allows, optionally deleting the branch, or set it to merge itself once checks pass and reviews allow (type `merge`) |
@@ -203,7 +205,7 @@ a header for each step.
 | `c` | draft a comment on this line |
 | `C` | suggest a change to this line: a draft that starts as the line, to edit into what it should be |
 | `a` | apply the suggested change on this line to your checkout, when it is at the pull request's head (asks first; you commit) |
-| `e` `x` | edit, delete your draft on this line |
+| `e` `x` | edit, delete your draft on this line, or your comment already posted there (deleting asks first) |
 | `R` | reply to the thread on this line (posts at once) |
 | `z` | resolve the thread on this line, or open it again; resolved threads fold to a line |
 | `v` | send the review |

@@ -276,6 +276,10 @@ type Event struct {
 	State  string // a review's: APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED
 	At     time.Time
 	Extra  string // a commit's short SHA, a review's comment count
+
+	// A comment's node id, and whether you may change it.
+	ID                 string
+	CanEdit, CanDelete bool
 }
 
 // Check is one status check on a pull request's head commit.
@@ -315,6 +319,7 @@ type Detail struct {
 	Linked    []Item // pull requests that will close this issue
 	Methods   []string
 
+	CanEdit     bool   // you may change its title and description
 	AutoAllowed bool   // the repository lets pull requests merge themselves once they can
 	AutoMerge   string // the method set to merge with once checks and reviews allow, or ""
 	AutoBy      string
@@ -326,7 +331,7 @@ const detailQuery = `query($o: String!, $n: String!, $num: Int!) {
 		issueOrPullRequest(number: $num) {
 			__typename
 			... on PullRequest {
-				id number title state url body createdAt updatedAt isDraft headRefName baseRefName headRefOid
+				id number title state url body createdAt updatedAt isDraft headRefName baseRefName headRefOid viewerCanUpdate
 				reviewDecision additions deletions changedFiles mergeable mergeStateStatus isCrossRepository
 				autoMergeRequest { mergeMethod enabledBy { login } }
 				author { login }
@@ -345,7 +350,7 @@ const detailQuery = `query($o: String!, $n: String!, $num: Int!) {
 				timelineItems(last: 60, itemTypes: [ISSUE_COMMENT, PULL_REQUEST_REVIEW, PULL_REQUEST_COMMIT, MERGED_EVENT, CLOSED_EVENT, REOPENED_EVENT]) {
 					nodes {
 						__typename
-						... on IssueComment { author { login } body createdAt }
+						... on IssueComment { id author { login } body createdAt viewerCanUpdate viewerCanDelete }
 						... on PullRequestReview { author { login } body state submittedAt comments { totalCount } }
 						... on PullRequestCommit { commit { oid messageHeadline committedDate author { user { login } name } } }
 						... on MergedEvent { actor { login } createdAt }
@@ -355,7 +360,7 @@ const detailQuery = `query($o: String!, $n: String!, $num: Int!) {
 				}
 			}
 			... on Issue {
-				id number title state url body createdAt updatedAt
+				id number title state url body createdAt updatedAt viewerCanUpdate
 				author { login }
 				comments { totalCount }
 				labels(first: 100) { nodes { name } }
@@ -364,7 +369,7 @@ const detailQuery = `query($o: String!, $n: String!, $num: Int!) {
 				timelineItems(last: 60, itemTypes: [ISSUE_COMMENT, CLOSED_EVENT, REOPENED_EVENT]) {
 					nodes {
 						__typename
-						... on IssueComment { author { login } body createdAt }
+						... on IssueComment { id author { login } body createdAt viewerCanUpdate viewerCanDelete }
 						... on ClosedEvent { actor { login } createdAt }
 						... on ReopenedEvent { actor { login } createdAt }
 					}
@@ -376,6 +381,9 @@ const detailQuery = `query($o: String!, $n: String!, $num: Int!) {
 
 type gqlEvent struct {
 	Typename    string    `json:"__typename"`
+	ID          string    `json:"id"`
+	CanUpdate   bool      `json:"viewerCanUpdate"`
+	CanDelete   bool      `json:"viewerCanDelete"`
 	Author      *gqlLogin `json:"author"`
 	Actor       *gqlLogin `json:"actor"`
 	Body        string    `json:"body"`
@@ -406,7 +414,8 @@ func login(l *gqlLogin) string {
 func (g gqlEvent) event() (Event, bool) {
 	switch g.Typename {
 	case "IssueComment":
-		return Event{Kind: "comment", Author: login(g.Author), Body: cleanBody(g.Body), At: g.CreatedAt}, true
+		return Event{Kind: "comment", Author: login(g.Author), Body: cleanBody(g.Body), At: g.CreatedAt,
+			ID: clean(g.ID), CanEdit: g.CanUpdate, CanDelete: g.CanDelete}, true
 	case "PullRequestReview":
 		// A review with no summary and only line comments is shown by its threads; keep it for its verdict.
 		e := Event{Kind: "review", Author: login(g.Author), Body: cleanBody(g.Body), State: clean(g.State), At: g.SubmittedAt}
@@ -455,6 +464,7 @@ func fetchDetail(repo string, number int) (*Detail, error) {
 				Body       string    `json:"body"`
 				CreatedAt  time.Time `json:"createdAt"`
 				HeadOID    string    `json:"headRefOid"`
+				CanUpdate  bool      `json:"viewerCanUpdate"`
 				Changed    int       `json:"changedFiles"`
 				Mergeable  string    `json:"mergeable"`
 				MergeState string    `json:"mergeStateStatus"`
@@ -531,7 +541,7 @@ func fetchDetail(repo string, number int) (*Detail, error) {
 	d := &Detail{
 		Item: n.item(), ID: n.ID, Body: cleanBody(n.Body), Created: n.CreatedAt, HeadSHA: clean(n.HeadOID),
 		Changed: n.Changed, Mergeable: clean(n.Mergeable), MergeWhy: clean(n.MergeState), Fork: n.CrossRepo,
-		AutoAllowed: resp.Repository.Auto,
+		AutoAllowed: resp.Repository.Auto, CanEdit: n.CanUpdate,
 	}
 	for _, r := range n.ReviewReqs.Nodes {
 		if r.Reviewer != nil {
@@ -745,6 +755,34 @@ func mergePR(repo string, number int, sha, method string) error {
 
 func deleteBranch(repo, branch string) error {
 	return ghWrite("DELETE", fmt.Sprintf("repos/%s/git/refs/heads/%s", repo, refPath(branch)), nil, nil)
+}
+
+// editItem changes a pull request's or issue's title and description.
+func editItem(id string, isPR bool, title, body string) error {
+	m := `mutation($id: ID!, $t: String!, $b: String!) { updateIssue(input: {id: $id, title: $t, body: $b}) { clientMutationId } }`
+	if isPR {
+		m = `mutation($id: ID!, $t: String!, $b: String!) { updatePullRequest(input: {pullRequestId: $id, title: $t, body: $b}) { clientMutationId } }`
+	}
+	return ghQuery(m, map[string]any{"id": id, "t": title, "b": body}, nil)
+}
+
+// editComment changes a comment in the conversation; deleteComment removes it.
+func editComment(id, body string) error {
+	return ghQuery(`mutation($id: ID!, $b: String!) { updateIssueComment(input: {id: $id, body: $b}) { clientMutationId } }`,
+		map[string]any{"id": id, "b": body}, nil)
+}
+
+func deleteComment(id string) error {
+	return ghQuery(`mutation($id: ID!) { deleteIssueComment(input: {id: $id}) { clientMutationId } }`, map[string]any{"id": id}, nil)
+}
+
+// editReviewComment changes one of your comments on a line of the diff; deleteReviewComment removes it.
+func editReviewComment(repo string, id int64, body string) error {
+	return ghWrite("PATCH", fmt.Sprintf("repos/%s/pulls/comments/%d", repo, id), map[string]string{"body": body}, nil)
+}
+
+func deleteReviewComment(repo string, id int64) error {
+	return ghWrite("DELETE", fmt.Sprintf("repos/%s/pulls/comments/%d", repo, id), nil, nil)
 }
 
 // updateBranch brings the base branch's new commits into a pull request's branch, by a merge commit or by rebasing,
@@ -1098,6 +1136,7 @@ func createPR(repo, base, head, title, body string, draft bool) (Item, error) {
 // comment's id; the files you have marked viewed; and the commit your last review was on.
 type ReviewState struct {
 	PRID       string
+	Viewer     string // your login
 	Threads    map[int64]ThreadState
 	Viewed     map[string]bool
 	LastReview string // the head commit when you last reviewed, or ""
@@ -1112,6 +1151,7 @@ type ThreadState struct {
 func fetchReviewState(repo string, number int) (*ReviewState, error) {
 	owner, name, _ := strings.Cut(repo, "/")
 	q := `query($o: String!, $n: String!, $num: Int!, $after: String) {
+		viewer { login }
 		repository(owner: $o, name: $n) {
 			pullRequest(number: $num) {
 				id
@@ -1125,6 +1165,7 @@ func fetchReviewState(repo string, number int) (*ReviewState, error) {
 	var after *string
 	for page := 0; page < 30; page++ {
 		var resp struct {
+			Viewer     gqlLogin `json:"viewer"`
 			Repository *struct {
 				PR *struct {
 					ID     string `json:"id"`
@@ -1154,7 +1195,7 @@ func fetchReviewState(repo string, number int) (*ReviewState, error) {
 			return nil, fmt.Errorf("GitHub has no pull request #%d in %s", number, repo)
 		}
 		pr := resp.Repository.PR
-		st.PRID = pr.ID
+		st.PRID, st.Viewer = pr.ID, clean(resp.Viewer.Login)
 		if pr.Latest != nil && pr.Latest.Commit != nil {
 			st.LastReview = clean(pr.Latest.Commit.OID)
 		}
