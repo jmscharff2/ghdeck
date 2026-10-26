@@ -217,6 +217,10 @@ func (v *itemView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 		if it.IsPR {
 			return true, worktreeCmd(v.repo, it.Number)
 		}
+	case "w":
+		if it.IsPR && it.State == "OPEN" && v.d != nil {
+			return true, pushView(workPicker(v.repo, it, v.d))
+		}
 	case "a":
 		if inHerdr() {
 			return true, pushView(newAgentPicker(v.repo, itemPrompt(repo, it, v.d)))
@@ -639,6 +643,9 @@ func (v *itemView) footer(w int) string {
 			keys = append(keys, [2]string{"m", "merge"}, [2]string{"R", "reviewers"}, [2]string{"D", "draft/ready"})
 		}
 		keys = append(keys, [2]string{"C", "checkout"}, [2]string{"W", "worktree"})
+		if inHerdr() && it.State == "OPEN" {
+			keys = append(keys, [2]string{"w", "work on it"})
+		}
 	} else {
 		keys = append(keys, [2]string{"A", "assign me"})
 	}

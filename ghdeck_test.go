@@ -499,3 +499,49 @@ func TestMergedBranches(t *testing.T) {
 		t.Error("plural")
 	}
 }
+
+// A pull request handed to an agent: its push and how its checks end are news; the same state again is not.
+func TestAnnounceWatched(t *testing.T) {
+	t.Setenv("HERDR_ENV", "") // no real notifications from a test
+	t.Setenv("HERDR_PANE_ID", "")
+	m := newModel(Repo{Slug: "o/r"})
+	m.watching = map[int]*watch{7: {sha: "aaa", checks: "FAILURE"}}
+	said := func(s Status) []string {
+		cmd := m.announceWatched(s)
+		if cmd == nil {
+			return nil
+		}
+		var out []string
+		var run func(tea.Msg)
+		run = func(msg tea.Msg) {
+			switch msg := msg.(type) {
+			case tea.BatchMsg:
+				for _, c := range msg {
+					if c != nil {
+						run(c())
+					}
+				}
+			case actionMsg:
+				out = append(out, msg.text)
+			}
+		}
+		run(cmd())
+		return out
+	}
+	open := func(sha, checks string) Status {
+		return Status{Watched: map[int]Item{7: {Number: 7, Title: "Fix", State: "OPEN", HeadSHA: sha, Checks: checks}}}
+	}
+	if got := said(open("bbb", "PENDING")); len(got) != 1 || !strings.HasPrefix(got[0], "Agent pushed") {
+		t.Errorf("a push: %q", got)
+	}
+	if got := said(open("bbb", "PENDING")); len(got) != 0 {
+		t.Errorf("nothing new: %q", got)
+	}
+	if got := said(open("bbb", "SUCCESS")); len(got) != 1 || !strings.HasPrefix(got[0], "Checks passed") {
+		t.Errorf("checks passing: %q", got)
+	}
+	closed := Status{Watched: map[int]Item{7: {Number: 7, State: "MERGED"}}}
+	if got := said(closed); len(got) != 1 || len(m.watching) != 0 {
+		t.Errorf("a merged pull request stops being watched: %q, %d left", got, len(m.watching))
+	}
+}

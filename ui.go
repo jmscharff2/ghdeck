@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -79,7 +80,9 @@ type model struct {
 	confirm *confirmation
 	help    bool
 	stack   []subview
-	tickGen int // which tick is current, so waking up does not leave a slow one running beside it
+	// watching is the pull requests handed to an agent with w, by number.
+	watching map[int]*watch
+	tickGen  int // which tick is current, so waking up does not leave a slow one running beside it
 
 	// openBranch opens the branch's pull request as soon as the first status says which it is.
 	openBranch bool
@@ -125,8 +128,13 @@ func (m model) mark(key, query string) {
 
 func (m model) refreshStatus() tea.Cmd {
 	repo, branch := m.repo.Slug, m.branch
+	var watched []int
+	for n := range m.watching {
+		watched = append(watched, n)
+	}
+	sort.Ints(watched)
 	m.mark(kStatus, "")
-	return load(kStatus, "", func() (any, error) { return fetchStatus(repo, branch) })
+	return load(kStatus, "", func() (any, error) { return fetchStatus(repo, branch, watched...) })
 }
 
 func (m model) listQuery(tab int) string {
@@ -328,7 +336,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sel[m.tab] = max(0, n-1)
 		}
 		if msg.key == kStatus && msg.err == nil {
-			cmd := m.announce(before)
+			cmd := tea.Batch(m.announce(before), m.announceWatched(m.status()))
 			if m.openBranch {
 				m.openBranch = false
 				if pr := m.status().BranchPR; pr != nil {
@@ -350,6 +358,21 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case execMsg:
 		return m, execHere(msg)
+	case workStartedMsg:
+		if msg.err != nil {
+			m.say(errText(msg.err), true)
+			return m, nil
+		}
+		if m.watching == nil {
+			m.watching = map[int]*watch{}
+		}
+		m.watching[msg.number] = &watch{sha: msg.sha, checks: msg.checks, pane: msg.pane}
+		how := "started an agent"
+		if msg.reused {
+			how = "gave it to the agent"
+		}
+		m.say(fmt.Sprintf("#%d: %s in pane %s · watching for its pushes and checks", msg.number, how, msg.pane), false)
+		return m, nil
 	case tea.KeyMsg:
 		if m.confirm != nil {
 			return m.updateConfirm(msg)
@@ -559,6 +582,10 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "W":
 		if it, ok := m.selected(); ok && it.IsPR {
 			return m, worktreeCmd(m.repo, it.Number)
+		}
+	case "w":
+		if it, ok := m.selected(); ok && it.IsPR && it.State == "OPEN" {
+			return m, pushView(workPicker(m.repo, it, nil))
 		}
 	case "a":
 		if !inHerdr() {

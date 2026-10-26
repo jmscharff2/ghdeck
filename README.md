@@ -73,6 +73,10 @@ Inside Herdr, ghdeck also:
   checking a branch out, signing in). Outside Herdr they borrow the terminal until they exit.
 - **opens a pull request's worktree as a Herdr workspace** (`W`), checked out beside your checkout, so you can run it
   or give it to an agent without touching your branch.
+- **works on a pull request with an agent, in one key** (`w`): it checks the branch out in a worktree beside yours,
+  opens that as a Herdr workspace, and starts an agent there (Claude Code, Codex, or whichever is installed), or uses
+  the one already in it. The prompt names the unresolved threads and failing checks, and you see it, and can edit it,
+  first. Then ghdeck watches the pull request and tells you when the agent pushes and how the checks come out.
 - **hands work to an agent** (`a`): a pull request, an issue, failing checks or a failed run. It lists the agents
   Herdr is running, the ones working in this repo first, and shows the prompt it will send, which `e` lets you edit
   first. If no agent fits, it can start Claude Code in a new pane.
@@ -130,6 +134,7 @@ a header for each step.
 | `n` | new pull request from any branch into any other (Issues: `gh issue create`) |
 | `C` | check the pull request out here (asks first, and warns about uncommitted changes) |
 | `W` | check it out in a worktree beside this checkout and, in Herdr, open that as a workspace |
+| `w` | work on it: the worktree, an agent in it with what is left to do, and news of its pushes and checks (Herdr) |
 | `a` | hand the pull request or issue to an agent (Herdr) |
 | `o` | open on GitHub |
 | `A` | `gh auth login`, when the login has expired |
@@ -150,6 +155,7 @@ a header for each step.
 | `R` | reviewers: GitHub's suggestions first, teams, and anyone who can be assigned (space ticks, typing filters) |
 | `L` | labels |
 | `C` `W` | check out here, or in a worktree |
+| `w` | work on it with an agent in its own worktree (Herdr) |
 | `p` | an issue's linked pull request |
 | `a` `o` `r` | hand to an agent, open on GitHub, refresh |
 

@@ -25,6 +25,7 @@ type Item struct {
 
 	// Pull requests only.
 	Head, Base string
+	HeadSHA    string
 	Review     string // reviewDecision: APPROVED, CHANGES_REQUESTED, REVIEW_REQUIRED, or ""
 	Checks     string // the head commit's rollup: SUCCESS, FAILURE, ERROR, PENDING, EXPECTED, or ""
 	Additions  int
@@ -62,6 +63,7 @@ type gqlItem struct {
 	IsDraft    bool      `json:"isDraft"`
 	HeadRef    string    `json:"headRefName"`
 	BaseRef    string    `json:"baseRefName"`
+	HeadOID    string    `json:"headRefOid"`
 	Review     string    `json:"reviewDecision"`
 	Additions  int       `json:"additions"`
 	Deletions  int       `json:"deletions"`
@@ -82,7 +84,7 @@ type gqlItem struct {
 }
 
 const prFields = `
-		number title state url updatedAt isDraft headRefName baseRefName reviewDecision additions deletions
+		number title state url updatedAt isDraft headRefName baseRefName headRefOid reviewDecision additions deletions
 		author { login }
 		comments { totalCount }
 		labels(first: 6) { nodes { name } }
@@ -107,6 +109,7 @@ func (g gqlItem) item() Item {
 		IsPR: g.Typename == "PullRequest", Draft: g.IsDraft, Comments: g.CommentsCt.Total,
 		Labels: g.Labels.list(), Assignees: g.Assignees.list(),
 		Head: clean(g.HeadRef), Base: clean(g.BaseRef), Review: clean(g.Review), Additions: g.Additions, Deletions: g.Deletions,
+		HeadSHA: clean(g.HeadOID),
 	}
 	if g.Author != nil {
 		it.Author = clean(g.Author.Login)
@@ -188,17 +191,23 @@ func fetchList(query string) (List, error) {
 type Status struct {
 	Viewer    string
 	BranchPR  *Item
-	ReviewFor []Item // open pull requests asking for your review
+	ReviewFor []Item       // open pull requests asking for your review
+	Watched   map[int]Item // pull requests handed to an agent, watched for pushes and checks
 }
 
-func fetchStatus(repo, branch string) (Status, error) {
+func fetchStatus(repo, branch string, watched ...int) (Status, error) {
 	owner, name, _ := strings.Cut(repo, "/")
+	var w strings.Builder
+	for _, n := range watched {
+		fmt.Fprintf(&w, "w%d: pullRequest(number: %d) { __typename %s }\n", n, n, prFields)
+	}
 	q := `query($o: String!, $n: String!, $b: String!, $rq: String!, $hasBranch: Boolean!) {
 		viewer { login }
 		repository(owner: $o, name: $n) {
 			pullRequests(headRefName: $b, first: 1, states: [OPEN], orderBy: {field: UPDATED_AT, direction: DESC}) @include(if: $hasBranch) {
 				nodes { __typename ` + prFields + ` }
 			}
+			` + w.String() + `
 		}
 		review: search(query: $rq, type: ISSUE, first: 20) { nodes {` + itemFields + `} }
 	}`
@@ -213,14 +222,27 @@ func fetchStatus(repo, branch string) (Status, error) {
 			Nodes []gqlItem `json:"nodes"`
 		} `json:"review"`
 	}
+	var raw struct {
+		Repository map[string]json.RawMessage `json:"repository"`
+	}
+	var data json.RawMessage
 	err := ghQuery(q, map[string]any{
 		"o": owner, "n": name, "b": branch, "hasBranch": branch != "",
 		"rq": "repo:" + repo + " is:pr is:open review-requested:@me",
-	}, &resp)
+	}, &data)
 	if err != nil {
 		return Status{}, err
 	}
-	s := Status{Viewer: clean(resp.Viewer.Login)}
+	if json.Unmarshal(data, &resp) != nil || json.Unmarshal(data, &raw) != nil {
+		return Status{}, fmt.Errorf("GitHub: unexpected answer")
+	}
+	s := Status{Viewer: clean(resp.Viewer.Login), Watched: map[int]Item{}}
+	for _, n := range watched {
+		var g gqlItem
+		if b := raw.Repository[fmt.Sprintf("w%d", n)]; len(b) > 0 && json.Unmarshal(b, &g) == nil && g.Number != 0 {
+			s.Watched[n] = g.item()
+		}
+	}
 	if r := resp.Repository; r != nil && r.PRs != nil && len(r.PRs.Nodes) > 0 {
 		it := r.PRs.Nodes[0].item()
 		s.BranchPR = &it
