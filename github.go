@@ -725,6 +725,9 @@ type DraftComment struct {
 	Line int    `json:"line"`
 	Side string `json:"side"` // RIGHT for the new code, LEFT for removed lines
 	Body string `json:"body"`
+	// A comment on several lines starts here; Line is its last.
+	StartLine int    `json:"start_line,omitempty"`
+	StartSide string `json:"start_side,omitempty"`
 }
 
 // submitReview sends a review in one request: its verdict, its summary and every line comment drafted for it.

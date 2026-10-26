@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -702,4 +703,45 @@ func TestMultiPickerKeepsWhatItDidNotOffer(t *testing.T) {
 	failed := newMultiPicker("Labels", []string{"bug"}, func([]string) tea.Cmd { t.Error("applied after a failed load"); return nil })
 	failed.Update(pickerLoadedMsg{id: failed.id, err: errors.New("rate limited")})
 	failed.Update(tea.KeyMsg{Type: tea.KeyEnter})
+}
+
+// m marks the first line; C on the last drafts a suggestion for all of them, starting from their text.
+func TestMultiLineSuggestion(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // drafts are saved to the cache directory
+	t.Setenv("XDG_CACHE_HOME", "")
+	v := newDiffView(Repo{Slug: "o/r"}, 1, "t")
+	v.drafts = nil
+	v.files = []File{{Path: "a.go", Patch: "@@ -1,3 +1,3 @@\n one\n-two\n+2\n three"}}
+	key := func(k string) tea.Cmd {
+		_, cmd := v.key(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)})
+		return cmd
+	}
+	key("j") // one
+	key("m")
+	key("j")
+	key("j")
+	key("j") // three
+	cmd := key("C")
+	if cmd == nil {
+		t.Fatalf("C should open the composer: %s", v.note)
+	}
+	c, ok := cmd().(pushViewMsg).v.(*composer)
+	if !ok {
+		t.Fatal("C should open a composer")
+	}
+	if got := c.ta.Value(); got != "```suggestion\none\n2\nthree\n```" {
+		t.Errorf("the suggestion should start as the new lines: %q", got)
+	}
+	c.done("```suggestion\nall\n```")
+	if len(v.drafts) != 1 {
+		t.Fatal("a draft should be added")
+	}
+	d := v.drafts[0]
+	if d.StartLine != 1 || d.Line != 3 || d.StartSide != "RIGHT" || d.Side != "RIGHT" || v.mark != -1 {
+		t.Errorf("draft = %+v, mark %d", d, v.mark)
+	}
+	b, _ := json.Marshal(d)
+	if !strings.Contains(string(b), `"start_line":1`) {
+		t.Errorf("the review payload should carry start_line: %s", b)
+	}
 }

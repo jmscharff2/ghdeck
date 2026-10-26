@@ -203,7 +203,8 @@ a header for each step.
 | `{` `}` | previous, next hunk |
 | `t` `T` | next, previous line with an open thread or a draft, across files |
 | `c` | draft a comment on this line |
-| `C` | suggest a change to this line: a draft that starts as the line, to edit into what it should be |
+| `m` | mark the first line of a comment on several lines; `c` or `C` on the last line covers them all (`esc` clears) |
+| `C` | suggest a change to this line, or the marked lines: a draft that starts as they are, to edit into what they should be |
 | `a` | apply the suggested change on this line to your checkout, when it is at the pull request's head (asks first; you commit) |
 | `e` `x` | edit, delete your draft on this line, or your comment already posted there (deleting asks first) |
 | `R` | reply to the thread on this line (posts at once) |
