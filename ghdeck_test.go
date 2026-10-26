@@ -745,3 +745,36 @@ func TestMultiLineSuggestion(t *testing.T) {
 		t.Errorf("the review payload should carry start_line: %s", b)
 	}
 }
+
+func TestSavedSearches(t *testing.T) {
+	cfg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfg)
+	os.MkdirAll(cfg+"/ghdeck", 0o700)
+	os.WriteFile(cfg+"/ghdeck/config.json", []byte(`{
+		"pull_requests": [{"name": "my team", "query": "is:open team-review-requested:acme/web"}],
+		"repos": {"Acme/Web": {"issues": [{"name": "needs QA", "query": "is:open label:qa"}]},
+		          "other/repo": {"issues": [{"name": "not here", "query": "x"}]}}
+	}`), 0o600)
+	root := t.TempDir()
+	os.WriteFile(root+"/.ghdeck.json", []byte(`{"pull_requests": [{"name": "release", "query": "is:open base:release"}]}`), 0o644)
+	prs, issues, err := loadFilters(Repo{Slug: "acme/web", Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := func(fs []filter) (out []string) {
+		for _, f := range fs {
+			out = append(out, f.name)
+		}
+		return
+	}
+	if got := strings.Join(names(prs[len(prFilters):]), ","); got != "my team,release" {
+		t.Errorf("pull request searches = %q", got)
+	}
+	if got := strings.Join(names(issues[len(issueFilters):]), ","); got != "needs QA" {
+		t.Errorf("issue searches = %q", got)
+	}
+	os.WriteFile(cfg+"/ghdeck/config.json", []byte(`{not json`), 0o600)
+	if prs, _, err := loadFilters(Repo{Slug: "acme/web"}); err == nil || len(prs) != len(prFilters) {
+		t.Error("a broken config should be reported, with the presets still there")
+	}
+}

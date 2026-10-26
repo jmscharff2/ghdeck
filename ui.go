@@ -54,6 +54,9 @@ type actionMsg struct {
 
 type tickMsg struct{ gen int }
 
+// filterMsg chooses a list's filter, from the F picker.
+type filterMsg struct{ tab, filter int }
+
 // agentsMsg brings which agent is on which branch, from Herdr and local git.
 type agentsMsg map[string]agent
 
@@ -71,10 +74,11 @@ type model struct {
 	panels   map[string]*panel
 	tab      int
 	sel      [4]int
-	filter   [2]int    // the preset search for pull requests and issues
-	search   [2]string // a search typed with /, replacing the preset
-	runsMine bool      // Actions shows only the current branch's runs
-	inboxAll bool      // the inbox shows read notifications too
+	filter   [2]int      // the preset search for pull requests and issues
+	filters  [2][]filter // the presets, then your saved searches
+	search   [2]string   // a search typed with /, replacing the preset
+	runsMine bool        // Actions shows only the current branch's runs
+	inboxAll bool        // the inbox shows read notifications too
 
 	typing bool
 	draft  string
@@ -103,7 +107,13 @@ type model struct {
 }
 
 func newModel(r Repo) model {
-	return model{repo: r, branch: currentBranch(r.Root), panels: map[string]*panel{}}
+	m := model{repo: r, branch: currentBranch(r.Root), panels: map[string]*panel{}}
+	var err error
+	m.filters[tabPRs], m.filters[tabIssues], err = loadFilters(r)
+	if err != nil {
+		m.say(errText(err), true)
+	}
+	return m
 }
 
 // agentsOn is the latest agentsMsg, for views that show the agent on a branch. Only the UI goroutine touches it.
@@ -215,11 +225,7 @@ func (m model) listQuery(tab int) string {
 		}
 		return ""
 	}
-	fs := prFilters
-	if tab == tabIssues {
-		fs = issueFilters
-	}
-	return searchQuery(m.repo.Slug, tab == tabPRs, fs[m.filter[tab]], m.search[tab])
+	return searchQuery(m.repo.Slug, tab == tabPRs, m.filters[tab][m.filter[tab]], m.search[tab])
 }
 
 func (m model) refreshTab(tab int) tea.Cmd {
@@ -458,6 +464,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case execMsg:
 		return m, execHere(msg)
+	case filterMsg:
+		m.filter[msg.tab], m.search[msg.tab], m.sel[msg.tab] = msg.filter, "", 0
+		return m, m.refreshTab(msg.tab)
 	case agentsMsg:
 		m.agents = msg
 		agentsOn = msg // for the pull request screen
@@ -624,13 +633,29 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.sel[m.tab] = 0
 			return m, m.refreshTab(m.tab)
 		}
-		n := len(prFilters)
-		if m.tab == tabIssues {
-			n = len(issueFilters)
-		}
-		m.filter[m.tab] = (m.filter[m.tab] + 1) % n
+		m.filter[m.tab] = (m.filter[m.tab] + 1) % len(m.filters[m.tab])
 		m.search[m.tab], m.sel[m.tab] = "", 0
 		return m, m.refreshTab(m.tab)
+	case "F":
+		if m.tab == tabPRs || m.tab == tabIssues {
+			tab, presets := m.tab, len(prFilters)
+			if tab == tabIssues {
+				presets = len(issueFilters)
+			}
+			var opts []option
+			for i, f := range m.filters[tab] {
+				i := i
+				detail := f.query
+				if i >= presets {
+					detail += sMuted.Render(" · saved")
+				}
+				opts = append(opts, option{label: f.name, match: f.name, detail: detail,
+					run: func() tea.Cmd { return func() tea.Msg { return filterMsg{tab, i} } }})
+			}
+			p := newPicker("Filter "+strings.ToLower(tabNames[tab]), opts)
+			p.sel, p.filterable = m.filter[tab], true
+			return m, pushView(p)
+		}
 	case "/":
 		if m.tab == tabPRs || m.tab == tabIssues {
 			m.typing, m.draft = true, m.search[m.tab]
@@ -988,11 +1013,7 @@ func (m model) filterLine() string {
 		}
 		p = m.panels[kRuns]
 	default:
-		fs := prFilters
-		if m.tab == tabIssues {
-			fs = issueFilters
-		}
-		what = fs[m.filter[m.tab]].name
+		what = m.filters[m.tab][m.filter[m.tab]].name
 		if s := m.search[m.tab]; s != "" {
 			what = "search: " + s
 		}
@@ -1242,9 +1263,9 @@ func (m model) footer() string {
 	keys := [][2]string{{"tab", "list"}, {"↑↓ enter", "open"}}
 	switch m.tab {
 	case tabPRs:
-		keys = append(keys, [2]string{"d", "diff"}, [2]string{"f", "filter"}, [2]string{"/", "search"})
+		keys = append(keys, [2]string{"d", "diff"}, [2]string{"f F", "filter"}, [2]string{"/", "search"})
 	case tabIssues:
-		keys = append(keys, [2]string{"f", "filter"}, [2]string{"/", "search"})
+		keys = append(keys, [2]string{"f F", "filter"}, [2]string{"/", "search"})
 	case tabRuns:
 		keys = append(keys, [2]string{"f", "this branch"})
 	case tabInbox:

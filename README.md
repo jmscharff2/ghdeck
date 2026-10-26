@@ -146,6 +146,22 @@ handles forks.
 **A run.** Its jobs, with the chosen job's steps beneath it, live while it runs. `enter` streams the job's log with
 a header for each step.
 
+## Saved searches
+
+The filters `f` steps through can grow your own: any GitHub search, named. Put them in `~/.config/ghdeck/config.json`
+for every repository or for one, or, for a team, in `.ghdeck.json` at the top of the repository. They hold searches
+only, so a repository's file needs no trusting.
+
+```json
+{
+  "pull_requests": [{ "name": "my team", "query": "is:open team-review-requested:acme/web" }],
+  "issues": [{ "name": "needs QA", "query": "is:open label:qa" }],
+  "repos": {
+    "acme/web": { "pull_requests": [{ "name": "into release", "query": "is:open base:release" }] }
+  }
+}
+```
+
 ## Keys
 
 **Lists**
@@ -156,6 +172,7 @@ a header for each step.
 | `↑` `↓` `enter` | choose and open |
 | `f` | next filter (Actions: all branches, or this one; inbox: unread, or everything) |
 | `x` | inbox: mark the notification done |
+| `F` | every filter, presets and saved searches, to pick one (typing filters) |
 | `/` | search with GitHub's syntax; `esc` clears it |
 | `d` | the chosen pull request's diff |
 | `b` | your branch's pull request |
