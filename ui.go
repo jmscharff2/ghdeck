@@ -537,7 +537,7 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "n":
 		switch m.tab {
 		case tabPRs:
-			return m, openPane("new pull request", m.dir(), "gh pr create -R "+shellQuote(m.repo.Slug), true)
+			return m, pushView(newPRFlow(m.repo, m.branch))
 		case tabIssues:
 			return m, openPane("new issue", m.dir(), "gh issue create -R "+shellQuote(m.repo.Slug), true)
 		}

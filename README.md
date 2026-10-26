@@ -65,8 +65,8 @@ command = "ghdeck.open"
 
 Inside Herdr, ghdeck also:
 
-- **opens interactive commands in a pane below** (`gh pr create`, `gh issue create`, checking a branch out, signing
-  in). Outside Herdr they borrow the terminal until they exit.
+- **opens interactive commands in a pane below** (`gh issue create`, `gh pr create` for a branch not pushed yet,
+  checking a branch out, signing in). Outside Herdr they borrow the terminal until they exit.
 - **opens a pull request's worktree as a Herdr workspace** (`W`), checked out beside your checkout, so you can run it
   or give it to an agent without touching your branch.
 - **hands work to an agent** (`a`): a pull request, an issue, failing checks or a failed run. It lists the agents
@@ -90,6 +90,23 @@ of their file. `c` drafts a comment on the line under the cursor. Drafts are sav
 `~/Library/Caches/ghdeck` on macOS, `~/.cache/ghdeck` on Linux), so closing the pane loses nothing. `v` sends every
 draft as one review, with a verdict and a summary.
 
+**A new pull request** (`n`). Choose the branch to merge, your checked-out branch first or any branch on GitHub,
+then the branch it goes into. ghdeck has no settings for how your team works; it reads that from where the
+repository's pull requests went, and puts the likeliest target first, saying why:
+
+- a branch that went somewhere before goes there again: `staging` into `main`, `develop` into `staging`
+- a branch in a family follows it: `release/1.5` goes where `release/1.4` went
+- a feature branch goes where feature branches go: `develop`, in a repository that works through `develop`
+- with no history to go on, the default branch.
+
+Typing filters either list, and names a branch that is not listed. ghdeck then shows what the merge would bring: the
+commits, the files, whether the branch is behind, any pull request already open between the two, and a warning when
+a long-lived branch would go into a feature branch. A promotion such as `staging` into `main` starts as "Merge staging
+into main" with the pull requests it carries listed, as release notes, and any commits pushed straight to the branch
+after them. A single commit starts with its own message. The repository's pull request template comes first. The
+first line is the title. It can open as a draft. A branch that is not pushed yet, or is on your fork, goes to
+`gh pr create`, which pushes it and handles forks.
+
 **A run.** Its jobs, with the chosen job's steps beneath it, live while it runs. `enter` streams the job's log with
 a header for each step.
 
@@ -105,7 +122,7 @@ a header for each step.
 | `/` | search with GitHub's syntax; `esc` clears it |
 | `d` | the chosen pull request's diff |
 | `b` | your branch's pull request |
-| `n` | new pull request or issue (`gh pr create`, `gh issue create`) |
+| `n` | new pull request from any branch into any other (Issues: `gh issue create`) |
 | `C` | check the pull request out here (asks first, and warns about uncommitted changes) |
 | `W` | check it out in a worktree beside this checkout and, in Herdr, open that as a workspace |
 | `a` | hand the pull request or issue to an agent (Herdr) |

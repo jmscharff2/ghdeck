@@ -166,6 +166,7 @@ func (c *composer) View(w, h int) string {
 type option struct {
 	label  string
 	detail string
+	match  string // what typing filters on, in a filterable picker: the label when empty
 	run    func() tea.Cmd
 }
 
@@ -189,6 +190,10 @@ type picker struct {
 	err     error
 	keys    [][2]string // extra keys for the help line
 	onKey   func(key string) (bool, tea.Cmd)
+	// filterable pickers take typing as a filter, for long lists like a repository's branches.
+	filterable bool
+	filter     string
+	extra      func(filter string) []option // offered after the matches, when none is exactly what was typed; not while loading
 }
 
 func newPicker(title string, opts []option) *picker {
@@ -215,16 +220,35 @@ func (p *picker) Update(msg tea.Msg) (bool, tea.Cmd) {
 	case pickerLoadedMsg:
 		p.loading, p.opts, p.err = false, msg.opts, msg.err
 	case tea.KeyMsg:
-		switch msg.String() {
+		shown := p.shown()
+		key := msg.String()
+		if p.filterable {
+			switch {
+			case key == "esc" && p.filter != "":
+				p.filter, p.sel = "", 0
+				return true, nil
+			case key == "backspace":
+				if r := []rune(p.filter); len(r) > 0 {
+					p.filter, p.sel = string(r[:len(r)-1]), 0
+				}
+				return true, nil
+			case msg.Type == tea.KeyRunes:
+				p.filter, p.sel = p.filter+string(msg.Runes), 0
+				return true, nil
+			case key == "j" || key == "k" || key == "q":
+				return true, nil // letters filter here; arrows move
+			}
+		}
+		switch key {
 		case "esc", "q":
 			return false, nil
 		case "up", "k":
 			p.sel = max(0, p.sel-1)
 		case "down", "j":
-			p.sel = max(0, min(len(p.opts)-1, p.sel+1))
+			p.sel = max(0, min(len(shown)-1, p.sel+1))
 		case "enter":
-			if p.sel < len(p.opts) {
-				if run := p.opts[p.sel].run; run != nil {
+			if p.sel < len(shown) {
+				if run := shown[p.sel].run; run != nil {
 					return false, run()
 				}
 				return false, nil
@@ -238,30 +262,64 @@ func (p *picker) Update(msg tea.Msg) (bool, tea.Cmd) {
 	return true, nil
 }
 
+// shown is the options that match the filter.
+func (p *picker) shown() []option {
+	if p.filter == "" {
+		return p.opts
+	}
+	var out []option
+	f, exact := strings.ToLower(p.filter), false
+	for _, o := range p.opts {
+		m := or(o.match, o.label)
+		if strings.Contains(strings.ToLower(m), f) {
+			out = append(out, o)
+			exact = exact || m == p.filter
+		}
+	}
+	if p.extra != nil && !exact && !p.loading {
+		out = append(out, p.extra(p.filter)...)
+	}
+	return out
+}
+
 func (p *picker) View(w, h int) string {
 	lines := []string{sTitle.Render(truncate(p.title, w-2)), ""}
 	if p.note != nil {
 		lines = append(lines, p.note(w)...)
 		lines = append(lines, "")
 	}
+	if p.filterable {
+		if p.filter == "" {
+			lines = append(lines, sMuted.Render(" type to filter"))
+		} else {
+			lines = append(lines, " "+sBold.Render(p.filter)+sMuted.Render("▏"))
+		}
+	}
+	shown := p.shown()
 	switch {
 	case p.loading:
 		lines = append(lines, sMuted.Render(" loading…"))
 	case p.err != nil:
 		lines = append(lines, sBad.Render(" "+truncate(errText(p.err), w-2)))
-	case len(p.opts) == 0:
+	case len(shown) == 0 && p.filter != "":
+		lines = append(lines, sMuted.Render(" nothing matches"))
+	case len(shown) == 0:
 		lines = append(lines, sMuted.Render(" nothing to choose from"))
 	}
-	for i, o := range p.opts {
+	// The choices scroll, keeping the chosen one in sight.
+	var rows []string
+	selRow := 0
+	for i, o := range shown {
 		cursor := "  "
 		label := o.label
 		if i == p.sel {
 			cursor = sTitle.Render("▸ ")
 			label = sBold.Render(label)
+			selRow = len(rows)
 		}
-		lines = append(lines, truncStyledLine(cursor+label, w))
+		rows = append(rows, truncStyledLine(cursor+label, w))
 		if o.detail != "" {
-			lines = append(lines, truncStyledLine("    "+sMuted.Render(o.detail), w))
+			rows = append(rows, truncStyledLine("    "+sMuted.Render(o.detail), w))
 		}
 	}
 	keys := [][2]string{{"↑↓", "choose"}, {"enter", "go"}}
@@ -269,6 +327,14 @@ func (p *picker) View(w, h int) string {
 	keys = append(keys, [2]string{"esc", "cancel"})
 	help := keyHelp(keys, w)
 	bodyH := h - lipgloss.Height(help)
+	if room := bodyH - len(lines); room > 0 && len(rows) > room {
+		start := scrollStart(selRow, len(rows), room)
+		if selRow+1 < len(rows) && selRow+1 >= start+room {
+			start++ // keep the chosen option's detail line with it
+		}
+		rows = rows[start:min(len(rows), start+room)]
+	}
+	lines = append(lines, rows...)
 	if len(lines) > bodyH {
 		lines = lines[:bodyH]
 	}
