@@ -228,7 +228,7 @@ func (v *diffView) Update(msg tea.Msg) (bool, tea.Cmd) {
 				v.files, v.sha = msg.files, msg.sha
 				if changed {
 					v.parsed = map[int][]diffLine{}
-					v.file, v.cursor, v.scroll = min(v.file, max(0, len(v.files)-1)), 0, 0
+					v.file, v.cursor, v.scroll, v.mark = min(v.file, max(0, len(v.files)-1)), 0, 0, -1
 				}
 			}
 			v.threads = groupThreads(msg.comments)
@@ -244,7 +244,7 @@ func (v *diffView) Update(msg tea.Msg) (bool, tea.Cmd) {
 			v.all = v.files
 		}
 		v.files, v.since = msg.files, true
-		v.parsed, v.file, v.cursor, v.scroll = map[int][]diffLine{}, 0, 0, 0
+		v.parsed, v.file, v.cursor, v.scroll, v.mark = map[int][]diffLine{}, 0, 0, 0, -1
 		v.note = fmt.Sprintf("%d file(s) changed since your last review · S shows everything", len(v.files))
 	case draftDeleteMsg:
 		v.changed++
@@ -425,6 +425,9 @@ func (v *diffView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 		// From the mark, when there is one: a comment on every line between.
 		lo, hi := v.cursor, v.cursor
 		startLine, startSide := 0, ""
+		if v.mark >= len(lines) { // the diff changed under the mark
+			v.mark = -1
+		}
 		if v.mark >= 0 && v.mark != v.cursor {
 			lo, hi = min(v.mark, v.cursor), max(v.mark, v.cursor)
 			for i := lo; i <= hi; i++ {
@@ -564,7 +567,7 @@ func (v *diffView) changePosted(c ReviewComment, del bool) tea.Cmd {
 		})
 		return nil
 	}
-	comp := newComposer(fmt.Sprintf("Edit your comment on %s:%d", c.Path, c.Line), nil, c.Body)
+	comp := newComposer(fmt.Sprintf("Edit your comment on %s:%d", c.Path, c.Line), nil, forEditing(c.Raw))
 	comp.send = func(body string) error { return editReviewComment(repo, c.ID, body) }
 	comp.done = func(string) tea.Cmd {
 		return tea.Batch(func() tea.Msg { return actionMsg{text: "comment updated"} }, v.fetch())
@@ -799,7 +802,7 @@ func (v *diffView) toggleSince() tea.Cmd {
 	if v.since {
 		v.files, v.all, v.since = v.all, nil, false
 		v.changed++
-		v.parsed, v.file, v.cursor, v.scroll = map[int][]diffLine{}, 0, 0, 0
+		v.parsed, v.file, v.cursor, v.scroll, v.mark = map[int][]diffLine{}, 0, 0, 0, -1
 		v.note = "the whole pull request"
 		return nil
 	}

@@ -825,3 +825,49 @@ func TestDiffRowsCacheInvalidates(t *testing.T) {
 		t.Error("a new draft should show at the next draw")
 	}
 }
+
+// A mark from a longer diff must not reach into a shorter one.
+func TestMarkDoesNotOutliveTheDiff(t *testing.T) {
+	v := newDiffView(Repo{Slug: "o/r"}, 1, "t")
+	v.drafts = nil
+	long := "@@ -1,9 +1,9 @@\n"
+	for i := 0; i < 9; i++ {
+		long += " line\n"
+	}
+	v.files = []File{{Path: "a.go", Patch: long}}
+	v.cursor = 8
+	v.key(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	v.Update(sinceMsg{id: v.id, files: []File{{Path: "a.go", Patch: "@@ -1,1 +1,1 @@\n x"}}})
+	v.cursor = 1
+	v.key(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}}) // panicked before
+	if v.mark != -1 {
+		t.Errorf("the mark should be gone: %d", v.mark)
+	}
+}
+
+// A repository's .ghdeck.json is anyone's: its names are cleaned, and it must be a small plain file.
+func TestRepoConfigIsUntrusted(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	root := t.TempDir()
+	os.WriteFile(root+"/.ghdeck.json", []byte(`{"pull_requests":[{"name":"\u001b]52;c;cHduZWQ=\u0007mine","query":"is:open"}]}`), 0o644)
+	prs, _, err := loadFilters(Repo{Slug: "o/r", Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last := prs[len(prs)-1].name; strings.ContainsAny(last, "\x1b\x07") || last != "mine" {
+		t.Errorf("name = %q", last)
+	}
+	os.Remove(root + "/.ghdeck.json")
+	os.Symlink("/dev/zero", root+"/.ghdeck.json")
+	if _, _, err := loadFilters(Repo{Slug: "o/r", Root: root}); err == nil {
+		t.Error("a symlink should be refused, not read")
+	}
+}
+
+// Editing starts from the text as written: tabs and all, without what could act on the terminal.
+func TestForEditing(t *testing.T) {
+	in := "build:\n\tgo build\n\x1b]52;c;eA==\x07done ‮rtl"
+	if got := forEditing(in); got != "build:\n\tgo build\ndone ‮rtl" {
+		t.Errorf("forEditing = %q", got)
+	}
+}

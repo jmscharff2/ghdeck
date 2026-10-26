@@ -57,6 +57,10 @@ type tickMsg struct{ gen int }
 // filterMsg chooses a list's filter, from the F picker.
 type filterMsg struct{ tab, filter int }
 
+// flashGoneMsg clears a flash that has been on screen long enough, so the footer changes by a message, not by the
+// clock: what a click measures is then what was drawn.
+type flashGoneMsg struct{ at time.Time }
+
 // agentsMsg brings which agent is on which branch, from Herdr and local git.
 type agentsMsg map[string]agent
 
@@ -87,6 +91,7 @@ type model struct {
 	flash   string
 	isErr   bool
 	flashAt time.Time
+	flashBy time.Time // the flash a timer is set to clear
 	confirm *confirmation
 	help    bool
 	stack   []subview
@@ -345,16 +350,26 @@ func (m *model) say(text string, isErr bool) { m.flash, m.isErr, m.flashAt = tex
 
 // Update notes each time someone uses ghdeck, and wakes it after a quiet spell.
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var wake tea.Cmd
 	switch msg.(type) {
 	case tea.KeyMsg, tea.MouseMsg:
-		woke := idle()
-		lastActive = time.Now()
-		if woke {
-			next, cmd := m.update(msg)
-			return next, tea.Batch(cmd, func() tea.Msg { return wakeMsg{} })
+		if idle() {
+			wake = func() tea.Msg { return wakeMsg{} }
 		}
+		lastActive = time.Now()
 	}
-	return m.update(msg)
+	next, cmd := m.update(msg)
+	nm, ok := next.(model)
+	if !ok {
+		return next, tea.Batch(cmd, wake)
+	}
+	var gone tea.Cmd
+	if nm.flash != "" && !nm.flashAt.Equal(nm.flashBy) {
+		at := nm.flashAt
+		nm.flashBy = at
+		gone = tea.Tick(8*time.Second, func(time.Time) tea.Msg { return flashGoneMsg{at} })
+	}
+	return nm, tea.Batch(cmd, wake, gone)
 }
 
 func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -466,6 +481,11 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, execHere(msg)
 	case tea.MouseMsg:
 		return m.mouse(msg)
+	case flashGoneMsg:
+		if msg.at.Equal(m.flashAt) {
+			m.flash = ""
+		}
+		return m, nil
 	case filterMsg:
 		m.filter[msg.tab], m.search[msg.tab], m.sel[msg.tab] = msg.filter, "", 0
 		return m, m.refreshTab(msg.tab)
@@ -1326,7 +1346,7 @@ func (m model) footer() string {
 		return c.view()
 	}
 	var b strings.Builder
-	if m.flash != "" && time.Since(m.flashAt) < 8*time.Second {
+	if m.flash != "" {
 		style := sGood
 		if m.isErr {
 			style = sBad

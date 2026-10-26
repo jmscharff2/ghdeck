@@ -277,9 +277,10 @@ type Event struct {
 	At     time.Time
 	Extra  string // a commit's short SHA, a review's comment count
 
-	// A comment's node id, and whether you may change it.
+	// A comment's node id, whether you may change it, and its text as written, for editing.
 	ID                 string
 	CanEdit, CanDelete bool
+	Raw                string
 }
 
 // Check is one status check on a pull request's head commit.
@@ -305,6 +306,7 @@ type Detail struct {
 	Item
 	ID        string // GraphQL node id, for mutations
 	Body      string
+	Raw       string // the description as written, for editing: Body is cleaned for the screen
 	Created   time.Time
 	HeadSHA   string
 	Changed   int
@@ -319,8 +321,9 @@ type Detail struct {
 	Linked    []Item // pull requests that will close this issue
 	Methods   []string
 
-	CanEdit     bool // you may change its title and description
-	HasQueue    bool // its base branch merges through a merge queue
+	CanEdit     bool   // you may change its title and description
+	Viewer      string // your login
+	HasQueue    bool   // its base branch merges through a merge queue
 	Queued      bool
 	QueuePos    int
 	AutoAllowed bool   // the repository lets pull requests merge themselves once they can
@@ -329,6 +332,7 @@ type Detail struct {
 }
 
 const detailQuery = `query($o: String!, $n: String!, $num: Int!) {
+	viewer { login }
 	repository(owner: $o, name: $n) {
 		squashMergeAllowed mergeCommitAllowed rebaseMergeAllowed viewerDefaultMergeMethod autoMergeAllowed
 		issueOrPullRequest(number: $num) {
@@ -419,7 +423,7 @@ func (g gqlEvent) event() (Event, bool) {
 	switch g.Typename {
 	case "IssueComment":
 		return Event{Kind: "comment", Author: login(g.Author), Body: cleanBody(g.Body), At: g.CreatedAt,
-			ID: clean(g.ID), CanEdit: g.CanUpdate, CanDelete: g.CanDelete}, true
+			ID: clean(g.ID), CanEdit: g.CanUpdate, CanDelete: g.CanDelete, Raw: g.Body}, true
 	case "PullRequestReview":
 		// A review with no summary and only line comments is shown by its threads; keep it for its verdict.
 		e := Event{Kind: "review", Author: login(g.Author), Body: cleanBody(g.Body), State: clean(g.State), At: g.SubmittedAt}
@@ -456,6 +460,7 @@ func cleanBody(s string) string {
 func fetchDetail(repo string, number int) (*Detail, error) {
 	owner, name, _ := strings.Cut(repo, "/")
 	var resp struct {
+		Viewer     gqlLogin `json:"viewer"`
 		Repository *struct {
 			Squash  bool   `json:"squashMergeAllowed"`
 			Merge   bool   `json:"mergeCommitAllowed"`
@@ -542,7 +547,9 @@ func fetchDetail(repo string, number int) (*Detail, error) {
 			} `json:"issueOrPullRequest"`
 		} `json:"repository"`
 	}
-	if err := ghQuery(detailQuery, map[string]any{"o": owner, "n": name, "num": number}, &resp); err != nil {
+	// The merge queue's fields are newer than some GitHub Enterprise Servers.
+	lean := []leanField{{"isInMergeQueue mergeQueueEntry { position } mergeQueue { id }", ""}}
+	if err := ghQueryLean("detail", detailQuery, lean, map[string]any{"o": owner, "n": name, "num": number}, &resp); err != nil {
 		return nil, err
 	}
 	if resp.Repository == nil || resp.Repository.Node == nil {
@@ -550,9 +557,10 @@ func fetchDetail(repo string, number int) (*Detail, error) {
 	}
 	n := resp.Repository.Node
 	d := &Detail{
-		Item: n.item(), ID: n.ID, Body: cleanBody(n.Body), Created: n.CreatedAt, HeadSHA: clean(n.HeadOID),
+		Item: n.item(), ID: n.ID, Body: cleanBody(n.Body), Raw: n.Body, Created: n.CreatedAt, HeadSHA: clean(n.HeadOID),
 		Changed: n.Changed, Mergeable: clean(n.Mergeable), MergeWhy: clean(n.MergeState), Fork: n.CrossRepo,
 		AutoAllowed: resp.Repository.Auto, CanEdit: n.CanUpdate, HasQueue: n.Queue != nil, Queued: n.Queued,
+		Viewer: clean(resp.Viewer.Login),
 	}
 	for _, r := range n.ReviewReqs.Nodes {
 		if r.Reviewer != nil {
@@ -696,6 +704,7 @@ type ReviewComment struct {
 	CommitID  string    `json:"commit_id"`
 	StartLine int       `json:"start_line"` // the first line of a comment on several, else 0
 	StartSide string    `json:"start_side"`
+	Raw       string    `json:"-"` // the body as written, for editing; Body is cleaned for the screen
 	Outdated  bool      `json:"-"`
 	Pending   bool      `json:"-"` // a draft of yours, not yet sent
 	DraftSide string    `json:"-"`
@@ -710,6 +719,7 @@ func fetchReviewComments(repo string, number int) ([]ReviewComment, error) {
 		}
 		for i := range cs {
 			c := &cs[i]
+			c.Raw = c.Body
 			c.Path, c.Side, c.Body, c.User.Login = clean(c.Path), clean(c.Side), cleanBody(c.Body), clean(c.User.Login)
 			// GitHub drops line when the code it was on has changed since.
 			c.Outdated = c.Line == 0
@@ -1215,7 +1225,7 @@ func fetchReviewState(repo string, number int) (*ReviewState, error) {
 				} `json:"pullRequest"`
 			} `json:"repository"`
 		}
-		if err := ghQuery(q, map[string]any{"o": owner, "n": name, "num": number, "after": after}, &resp); err != nil {
+		if err := ghQueryLean("review-state", q, idLean, map[string]any{"o": owner, "n": name, "num": number, "after": after}, &resp); err != nil {
 			return nil, err
 		}
 		if resp.Repository == nil || resp.Repository.PR == nil {
@@ -1246,6 +1256,9 @@ func fetchReviewState(repo string, number int) (*ReviewState, error) {
 	return st, nil
 }
 
+// idLean stands the older databaseId in for fullDatabaseId, on servers without it.
+var idLean = []leanField{{"nodes { fullDatabaseId }", "nodes { fullDatabaseId: databaseId }"}}
+
 // gqlThreads is a page of review threads, each known by its first comment's id: the id REST gives the comment.
 type gqlThreads struct {
 	PageInfo struct {
@@ -1257,7 +1270,7 @@ type gqlThreads struct {
 		Resolved bool   `json:"isResolved"`
 		Comments struct {
 			Nodes []struct {
-				ID string `json:"fullDatabaseId"` // a BigInt, as a string: the 32-bit databaseId runs out
+				ID flexID `json:"fullDatabaseId"` // a BigInt, as a string: the 32-bit databaseId runs out
 			} `json:"nodes"`
 		} `json:"comments"`
 	} `json:"nodes"`
@@ -1268,7 +1281,7 @@ func (st *ReviewState) add(page gqlThreads) {
 		if len(t.Comments.Nodes) == 0 {
 			continue
 		}
-		if id, err := strconv.ParseInt(t.Comments.Nodes[0].ID, 10, 64); err == nil {
+		if id, err := strconv.ParseInt(string(t.Comments.Nodes[0].ID), 10, 64); err == nil {
 			st.Threads[id] = ThreadState{ID: clean(t.ID), Resolved: t.Resolved}
 		}
 	}
@@ -1289,7 +1302,7 @@ func (st *ReviewState) moreThreads(owner, name string, number int, after string)
 				} `json:"pullRequest"`
 			} `json:"repository"`
 		}
-		if err := ghQuery(q, map[string]any{"o": owner, "n": name, "num": number, "after": after}, &resp); err != nil {
+		if err := ghQueryLean("review-threads", q, idLean, map[string]any{"o": owner, "n": name, "num": number, "after": after}, &resp); err != nil {
 			return err
 		}
 		if resp.Repository == nil || resp.Repository.PR == nil {
@@ -1369,7 +1382,7 @@ func fetchReviewers(repo string, number int) ([]Reviewer, error) {
 				author { login }
 				reviewRequests(first: 50) { nodes { requestedReviewer { __typename ... on User { login name } ... on Team { slug name } } } }
 				suggestedReviewers { isAuthor isCommenter reviewer { login name } }
-				latestReviews(first: 30) { nodes { state author { login } } }
+				latestReviews(first: 30) { nodes { state author { __typename login } } }
 			}
 			assignableUsers(first: 100) { nodes { login name } }
 		}
@@ -1396,8 +1409,11 @@ func fetchReviewers(repo string, number int) ([]Reviewer, error) {
 				} `json:"suggestedReviewers"`
 				Latest struct {
 					Nodes []struct {
-						State  string   `json:"state"`
-						Author gqlLogin `json:"author"`
+						State  string `json:"state"`
+						Author struct {
+							Typename string `json:"__typename"`
+							Login    string `json:"login"`
+						} `json:"author"`
 					} `json:"nodes"`
 				} `json:"latestReviews"`
 			} `json:"pullRequest"`
@@ -1432,6 +1448,9 @@ func fetchReviewers(repo string, number int) ([]Reviewer, error) {
 	}
 	// Those who reviewed already, to ask again after new commits.
 	for _, r := range pr.Latest.Nodes {
+		if r.Author.Typename != "User" {
+			continue // a bot's review: it cannot be asked again, and asking would fail the rest
+		}
 		word := map[string]string{"APPROVED": "approved", "CHANGES_REQUESTED": "asked for changes", "COMMENTED": "commented",
 			"DISMISSED": "review dismissed"}[r.State]
 		add(Reviewer{Login: clean(r.Author.Login), Reviewed: or(word, "reviewed")})

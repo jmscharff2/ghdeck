@@ -10,8 +10,8 @@ import (
 
 // Saved searches add to the preset filters f steps through: "my team's", "needs QA", whatever a GitHub search can
 // say. Yours live in ~/.config/ghdeck/config.json (or $XDG_CONFIG_HOME), for every repository or for one; a team's
-// can live in the repository, as .ghdeck.json at its top. Either holds searches only, never commands, so a file from
-// a repository needs no trusting.
+// can live in the repository, as .ghdeck.json at its top. Either holds searches only, never commands: the worst a
+// repository's file can do is search more widely. Its text is still cleaned, and it must be a small plain file.
 //
 //	{
 //	  "pull_requests": [{"name": "my team", "query": "is:open team-review-requested:acme/web"}],
@@ -51,23 +51,35 @@ func configPath() string {
 func loadFilters(r Repo) (prs, issues []filter, err error) {
 	prs, issues = append([]filter{}, prFilters...), append([]filter{}, issueFilters...)
 	add := func(s searches) {
+		// A repository's file is anyone's: its text is cleaned like everything else from outside.
 		for _, f := range s.PullRequests {
-			if f.Name != "" && strings.TrimSpace(f.Query) != "" {
-				prs = append(prs, filter{name: f.Name, query: f.Query})
+			if name, q := clean(f.Name), clean(f.Query); name != "" && strings.TrimSpace(q) != "" {
+				prs = append(prs, filter{name: name, query: q})
 			}
 		}
 		for _, f := range s.Issues {
-			if f.Name != "" && strings.TrimSpace(f.Query) != "" {
-				issues = append(issues, filter{name: f.Name, query: f.Query})
+			if name, q := clean(f.Name), clean(f.Query); name != "" && strings.TrimSpace(q) != "" {
+				issues = append(issues, filter{name: name, query: q})
 			}
 		}
 	}
 	read := func(path string) (config, error) {
 		var c config
-		b, err := os.ReadFile(path)
-		if os.IsNotExist(err) || path == "" {
+		if path == "" {
 			return c, nil
 		}
+		// A plain file, and a small one: a repository could commit a symlink to /dev/zero, or to a pipe.
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			return c, nil
+		}
+		if err != nil {
+			return c, err
+		}
+		if !info.Mode().IsRegular() || info.Size() > 256<<10 {
+			return c, fmt.Errorf("%s: not a plain file under 256 KB; ignored", path)
+		}
+		b, err := os.ReadFile(path)
 		if err != nil {
 			return c, err
 		}

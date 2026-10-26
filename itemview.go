@@ -164,7 +164,7 @@ func (v *itemView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 			what = "pull request"
 		}
 		c := newComposer(fmt.Sprintf("Edit #%d", d.Number), []string{sMuted.Render("The first line is the title; the rest is the description.")},
-			d.Title+"\n\n"+d.Body)
+			d.Title+"\n\n"+forEditing(d.Raw))
 		c.send = func(text string) error {
 			t, b, _ := strings.Cut(text, "\n")
 			if t = strings.TrimSpace(t); t == "" {
@@ -278,7 +278,8 @@ func (v *itemView) commentsPicker() *picker {
 	var opts []option
 	for i := len(v.d.Events) - 1; i >= 0; i-- { // the newest first
 		e := v.d.Events[i]
-		if e.Kind != "comment" || !e.CanEdit && !e.CanDelete {
+		// Maintainers may change anyone's comments; this lists only yours.
+		if e.Kind != "comment" || e.Author != v.d.Viewer || !e.CanEdit && !e.CanDelete {
 			continue
 		}
 		first, _, _ := strings.Cut(e.Body, "\n")
@@ -296,7 +297,7 @@ func (v *itemView) commentPicker(e Event) *picker {
 	var opts []option
 	if e.CanEdit {
 		opts = append(opts, option{label: "Edit", run: func() tea.Cmd {
-			c := newComposer("Edit your comment", nil, e.Body)
+			c := newComposer("Edit your comment", nil, forEditing(e.Raw))
 			c.send = func(body string) error { return editComment(e.ID, body) }
 			c.done = func(string) tea.Cmd { return v.after("comment updated") }
 			return pushView(c)
@@ -406,8 +407,8 @@ func (v *itemView) mergePicker() *picker {
 		}
 	}
 	for _, method := range d.Methods {
-		if d.Queued {
-			break // in the queue: leaving it is the only thing to do
+		if d.HasQueue {
+			break // the branch merges through its queue: the queue is the way in, or out
 		}
 		for _, del := range []bool{false, true} {
 			if del && d.Fork {
