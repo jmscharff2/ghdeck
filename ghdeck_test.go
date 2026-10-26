@@ -808,3 +808,20 @@ func TestMouse(t *testing.T) {
 		t.Errorf("the wheel should move the choice up: %d", next.(model).sel[tabPRs])
 	}
 }
+
+// The diff keeps its rows between keys, but never past a change to what they show.
+func TestDiffRowsCacheInvalidates(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", "")
+	v := newDiffView(Repo{Slug: "o/r"}, 1, "t")
+	v.drafts = nil
+	v.files = []File{{Path: "a.go", Patch: "@@ -1,1 +1,1 @@\n+x := 1"}}
+	if strings.Contains(v.View(100, 20), "your draft") {
+		t.Fatal("no draft yet")
+	}
+	v.drafts = append(v.drafts, DraftComment{Path: "a.go", Line: 1, Side: "RIGHT", Body: "hm"})
+	v.saveDrafts("drafted")
+	if !strings.Contains(v.View(100, 20), "your draft") {
+		t.Error("a new draft should show at the next draw")
+	}
+}

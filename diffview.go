@@ -127,6 +127,29 @@ type diffView struct {
 	note   string
 	width  int // the last width drawn at
 	mark   int // where a comment on several lines starts (m), or -1
+
+	// The rows drawn last, kept while nothing they show changes: drawing a big file's every row on each key is slow.
+	// changed counts changes to the threads, drafts and what is resolved.
+	changed int
+	cache   struct {
+		key  rowsKey
+		rows []row
+	}
+}
+
+type rowsKey struct {
+	file, w, changed int
+	wrap, split      bool
+	ok               bool
+}
+
+// cachedRows is rows(w), drawn again only when something it shows has changed.
+func (v *diffView) cachedRows(w int) []row {
+	k := rowsKey{file: v.file, w: w, changed: v.changed, wrap: v.wrap, split: v.split, ok: true}
+	if v.cache.key != k {
+		v.cache.key, v.cache.rows = k, v.rows(w)
+	}
+	return v.cache.rows
 }
 
 func newDiffView(r Repo, number int, title string) *diffView {
@@ -181,6 +204,7 @@ func (v *diffView) Update(msg tea.Msg) (bool, tea.Cmd) {
 	switch msg := msg.(type) {
 	case diffDataMsg:
 		v.loading = false
+		v.changed++
 		if msg.err != nil {
 			v.err = msg.err
 		} else {
@@ -211,6 +235,7 @@ func (v *diffView) Update(msg tea.Msg) (bool, tea.Cmd) {
 		}
 	case sinceMsg:
 		v.loading, v.sinceLoading = false, false
+		v.changed++
 		if msg.err != nil {
 			v.note = "can't compare with your last review: " + errText(msg.err)
 			return true, nil
@@ -222,6 +247,7 @@ func (v *diffView) Update(msg tea.Msg) (bool, tea.Cmd) {
 		v.parsed, v.file, v.cursor, v.scroll = map[int][]diffLine{}, 0, 0, 0
 		v.note = fmt.Sprintf("%d file(s) changed since your last review · S shows everything", len(v.files))
 	case draftDeleteMsg:
+		v.changed++
 		if msg.index < len(v.drafts) {
 			v.drafts = append(v.drafts[:msg.index:msg.index], v.drafts[msg.index+1:]...)
 		}
@@ -496,7 +522,7 @@ func (v *diffView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 			return true, nil
 		}
 		return true, pushView(reviewPicker(v.repo.Slug, v.number, v.sha, append([]DraftComment(nil), v.drafts...), func(text string) tea.Cmd {
-			v.drafts = nil
+			v.drafts, v.changed = nil, v.changed+1
 			return tea.Batch(func() tea.Msg { return actionMsg{text: text, refresh: true} }, v.fetch())
 		}))
 	}
@@ -718,6 +744,7 @@ func (v *diffView) toggleResolved() tea.Cmd {
 	}
 	resolve := !ts2.Resolved
 	ts2.Resolved = resolve
+	v.changed++
 	v.state.Threads[t.root.ID] = ts2 // shown at once; the reload after confirms it
 	text := "thread resolved"
 	if !resolve {
@@ -771,6 +798,7 @@ func (v *diffView) toggleViewed() tea.Cmd {
 func (v *diffView) toggleSince() tea.Cmd {
 	if v.since {
 		v.files, v.all, v.since = v.all, nil, false
+		v.changed++
 		v.parsed, v.file, v.cursor, v.scroll = map[int][]diffLine{}, 0, 0, 0
 		v.note = "the whole pull request"
 		return nil
@@ -805,6 +833,7 @@ func (m draftDeleteMsg) viewID() int { return m.id }
 
 // saveDrafts writes the drafts at once, on the UI, so saves land in order and a review sent next has them all.
 func (v *diffView) saveDrafts(text string) tea.Cmd {
+	v.changed++
 	err := saveDrafts(v.repo.Slug, v.number, v.drafts)
 	return func() tea.Msg {
 		if err != nil {
@@ -1225,7 +1254,7 @@ func (v *diffView) View(w, h int) string {
 	case v.file < len(v.files) && v.files[v.file].Patch == "":
 		body = []string{sMuted.Render(" No diff to show: the file is binary, or too large for GitHub to send. o opens it on GitHub.")}
 	default:
-		rows := v.rows(w)
+		rows := v.cachedRows(w)
 		// Keep the cursor's line on screen, with room for the threads under it when they fit.
 		first, lastRow := -1, -1
 		for i, r := range rows {
