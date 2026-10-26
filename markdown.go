@@ -30,16 +30,26 @@ func renderMarkdown(body string, w int) []string {
 	w = max(20, w)
 	body = htmlComment.ReplaceAllString(body, "")
 	var out []string
-	inCode := false
+	inCode, suggestion := false, false
 	blank := true
 	for _, line := range strings.Split(body, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
 			inCode = !inCode
+			// A suggested change: the lines that would replace the ones commented on.
+			suggestion = inCode && strings.TrimSpace(trimmed[3:]) == "suggestion"
+			if suggestion {
+				out = append(out, sWarn.Render("suggested change:"))
+			}
 			continue
 		}
 		if inCode {
-			out = append(out, sMuted.Render("│ ")+truncate(strings.ReplaceAll(line, "\t", "    "), w-2))
+			text := truncate(strings.ReplaceAll(line, "\t", "    "), w-2)
+			if suggestion {
+				out = append(out, sGood.Render("+ "+text))
+			} else {
+				out = append(out, sMuted.Render("│ ")+text)
+			}
 			blank = false
 			continue
 		}

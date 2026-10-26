@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -10,14 +11,15 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// The three lists, in tab order.
+// The lists, in tab order: the repository's three, then your inbox from every repository.
 const (
 	tabPRs = iota
 	tabIssues
 	tabRuns
+	tabInbox
 )
 
-var tabNames = []string{"Pull requests", "Issues", "Actions"}
+var tabNames = []string{"Pull requests", "Issues", "Actions", "Inbox"}
 
 // Data keys.
 const (
@@ -25,6 +27,7 @@ const (
 	kPRs    = "prs"
 	kIssues = "issues"
 	kRuns   = "runs"
+	kInbox  = "inbox"
 )
 
 type panel struct {
@@ -51,6 +54,9 @@ type actionMsg struct {
 
 type tickMsg struct{ gen int }
 
+// agentsMsg brings which agent is on which branch, from Herdr and local git.
+type agentsMsg map[string]agent
+
 // wakeMsg comes with the first key after ghdeck sat idle: refresh at once, and go back to the usual pace.
 type wakeMsg struct{}
 
@@ -64,10 +70,11 @@ type model struct {
 	branch   string
 	panels   map[string]*panel
 	tab      int
-	sel      [3]int
+	sel      [4]int
 	filter   [2]int    // the preset search for pull requests and issues
 	search   [2]string // a search typed with /, replacing the preset
 	runsMine bool      // Actions shows only the current branch's runs
+	inboxAll bool      // the inbox shows read notifications too
 
 	typing bool
 	draft  string
@@ -79,10 +86,16 @@ type model struct {
 	confirm *confirmation
 	help    bool
 	stack   []subview
+	// watching is the pull requests handed to an agent with w, by number.
+	watching map[int]*watch
+	// agents is Herdr's agents in this repo, by the branch each has checked out.
+	agents  map[string]agent
 	tickGen int // which tick is current, so waking up does not leave a slow one running beside it
 
 	// openBranch opens the branch's pull request as soon as the first status says which it is.
 	openBranch bool
+	// openTarget opens a pull request, issue or run at once (-open).
+	openTarget *target
 
 	// seen remembers what was already there, so only news is announced.
 	seenReviews map[int]bool
@@ -93,8 +106,69 @@ func newModel(r Repo) model {
 	return model{repo: r, branch: currentBranch(r.Root), panels: map[string]*panel{}}
 }
 
+// agentsOn is the latest agentsMsg, for views that show the agent on a branch. Only the UI goroutine touches it.
+var agentsOn map[string]agent
+
+// focusAgent switches Herdr to the agent working on a pull request's branch.
+func focusAgent(it Item) tea.Cmd {
+	a, ok := agentsOn[it.Head]
+	if !ok || !it.IsPR {
+		return func() tea.Msg {
+			return actionMsg{err: fmt.Errorf("no agent is on #%d's branch · w starts one", it.Number)}
+		}
+	}
+	return func() tea.Msg {
+		if _, err := run(herdrBin(), "agent", "focus", a.Pane); err != nil {
+			return actionMsg{err: fmt.Errorf("herdr agent focus: %w", err)}
+		}
+		return actionMsg{text: "switched to " + or(a.Kind, "the agent") + " in pane " + a.Pane}
+	}
+}
+
+// reportSidebar puts each of this repo's workspaces' pull request in Herdr's sidebar, from the open pull requests
+// ghdeck knows: the branch's, the watched ones, and the list's.
+func (m model) reportSidebar() tea.Cmd {
+	if !inHerdr() {
+		return nil
+	}
+	prs := map[string]Item{}
+	l, _ := m.list(tabPRs)
+	for _, it := range l.Items {
+		if it.State == "OPEN" && it.Head != "" {
+			prs[it.Head] = it
+		}
+	}
+	s := m.status()
+	for _, it := range s.Watched {
+		if it.State == "OPEN" {
+			prs[it.Head] = it
+		}
+	}
+	if s.BranchPR != nil {
+		prs[s.BranchPR.Head] = *s.BranchPR
+	}
+	r, ttl := m.repo, 3*pace(time.Minute)
+	return func() tea.Msg {
+		reportSidebar(r, prs, ttl)
+		return nil
+	}
+}
+
+// refreshAgents asks Herdr which agents are working in this repo, and on which branches. Nothing goes to GitHub.
+func (m model) refreshAgents() tea.Cmd {
+	if !inHerdr() || m.repo.Root == "" {
+		return nil
+	}
+	r := m.repo
+	return func() tea.Msg { return agentsMsg(agentsByBranch(r)) }
+}
+
 func (m model) Init() tea.Cmd {
-	return tea.Batch(m.refreshStatus(), m.refreshTab(tabPRs), m.tick())
+	cmds := []tea.Cmd{m.refreshStatus(), m.refreshTab(tabPRs), m.tick(), m.refreshAgents()}
+	if t := m.openTarget; t != nil {
+		cmds = append(cmds, pushView(t.view(m.repo)))
+	}
+	return tea.Batch(cmds...)
 }
 
 func load(key, query string, f func() (any, error)) tea.Cmd {
@@ -119,11 +193,22 @@ func (m model) mark(key, query string) {
 
 func (m model) refreshStatus() tea.Cmd {
 	repo, branch := m.repo.Slug, m.branch
+	var watched []int
+	for n := range m.watching {
+		watched = append(watched, n)
+	}
+	sort.Ints(watched)
 	m.mark(kStatus, "")
-	return load(kStatus, "", func() (any, error) { return fetchStatus(repo, branch) })
+	return load(kStatus, "", func() (any, error) { return fetchStatus(repo, branch, watched...) })
 }
 
 func (m model) listQuery(tab int) string {
+	if tab == tabInbox {
+		if m.inboxAll {
+			return "all"
+		}
+		return "unread"
+	}
 	if tab == tabRuns {
 		if m.runsMine {
 			return m.branch
@@ -140,6 +225,9 @@ func (m model) listQuery(tab int) string {
 func (m model) refreshTab(tab int) tea.Cmd {
 	q := m.listQuery(tab)
 	switch tab {
+	case tabInbox:
+		m.mark(kInbox, q)
+		return load(kInbox, q, func() (any, error) { return fetchNotifications(q == "all") })
 	case tabRuns:
 		repo := m.repo.Slug
 		m.mark(kRuns, q)
@@ -186,6 +274,28 @@ func (m model) runs() []Run {
 	return nil
 }
 
+func (m model) inbox() []Notification {
+	if p := m.panels[kInbox]; p != nil {
+		n, _ := p.val.([]Notification)
+		return n
+	}
+	return nil
+}
+
+// inboxSelected is the chosen notification, with the repository it belongs to: this one, with its checkout, or another.
+func (m model) inboxSelected() (Notification, Repo, bool) {
+	ns := m.inbox()
+	if m.tab != tabInbox || m.sel[tabInbox] >= len(ns) {
+		return Notification{}, Repo{}, false
+	}
+	n := ns[m.sel[tabInbox]]
+	r := Repo{Slug: n.Repo}
+	if strings.EqualFold(n.Repo, m.repo.Slug) {
+		r = m.repo
+	}
+	return n, r, true
+}
+
 func (m model) status() Status {
 	if p := m.panels[kStatus]; p != nil {
 		s, _ := p.val.(Status)
@@ -195,15 +305,18 @@ func (m model) status() Status {
 }
 
 func (m model) rows() int {
-	if m.tab == tabRuns {
+	switch m.tab {
+	case tabRuns:
 		return len(m.runs())
+	case tabInbox:
+		return len(m.inbox())
 	}
 	l, _ := m.list(m.tab)
 	return len(l.Items)
 }
 
 func (m model) selected() (Item, bool) {
-	if m.tab == tabRuns {
+	if m.tab == tabRuns || m.tab == tabInbox {
 		return Item{}, false
 	}
 	l, _ := m.list(m.tab)
@@ -279,7 +392,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.branch = currentBranch(m.repo.Root)
-		cmds := []tea.Cmd{m.tick()}
+		cmds := []tea.Cmd{m.tick(), m.refreshAgents()}
 		// The header asks GraphQL too, so it keeps to a minute even while the list goes faster.
 		if p := m.panels[kStatus]; p == nil || !p.loading && time.Since(p.at) > pace(time.Minute)-5*time.Second {
 			cmds = append(cmds, m.refreshStatus())
@@ -299,6 +412,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(cmds...)
 	case refreshNowMsg:
+		sharedRefresh() // after an action: what changed, from GitHub
 		cmds := []tea.Cmd{m.refreshStatus(), m.refreshTab(m.tab)}
 		if n := len(m.stack); n > 0 {
 			if r, ok := m.stack[n-1].(refresher); ok {
@@ -322,7 +436,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sel[m.tab] = max(0, n-1)
 		}
 		if msg.key == kStatus && msg.err == nil {
-			cmd := m.announce(before)
+			cmd := tea.Batch(m.announce(before), m.announceWatched(m.status()), m.reportSidebar())
 			if m.openBranch {
 				m.openBranch = false
 				if pr := m.status().BranchPR; pr != nil {
@@ -344,6 +458,25 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case execMsg:
 		return m, execHere(msg)
+	case agentsMsg:
+		m.agents = msg
+		agentsOn = msg // for the pull request screen
+		return m, nil
+	case workStartedMsg:
+		if msg.err != nil {
+			m.say(errText(msg.err), true)
+			return m, nil
+		}
+		if m.watching == nil {
+			m.watching = map[int]*watch{}
+		}
+		m.watching[msg.number] = &watch{sha: msg.sha, checks: msg.checks, pane: msg.pane}
+		how := "started an agent"
+		if msg.reused {
+			how = "gave it to the agent"
+		}
+		m.say(fmt.Sprintf("#%d: %s in pane %s · watching for its pushes and checks", msg.number, how, msg.pane), false)
+		return m, nil
 	case tea.KeyMsg:
 		if m.confirm != nil {
 			return m.updateConfirm(msg)
@@ -458,10 +591,11 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.switchTab((m.tab + 1) % len(tabNames))
 	case "shift+tab", "left", "H":
 		return m.switchTab((m.tab + len(tabNames) - 1) % len(tabNames))
-	case "1", "2", "3":
+	case "1", "2", "3", "4":
 		return m.switchTab(int(key[0] - '1'))
 	case "r":
 		m.say("refreshing", false)
+		sharedRefresh() // from GitHub, not another deck's answer
 		return m, tea.Batch(m.refreshStatus(), m.refreshTab(m.tab))
 	case "j", "down":
 		if m.sel[m.tab] < m.rows()-1 {
@@ -480,6 +614,11 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "pgup", "ctrl+u":
 		m.sel[m.tab] = max(0, m.sel[m.tab]-10)
 	case "f":
+		if m.tab == tabInbox {
+			m.inboxAll = !m.inboxAll
+			m.sel[m.tab] = 0
+			return m, m.refreshTab(m.tab)
+		}
 		if m.tab == tabRuns {
 			m.runsMine = !m.runsMine
 			m.sel[m.tab] = 0
@@ -493,15 +632,18 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.search[m.tab], m.sel[m.tab] = "", 0
 		return m, m.refreshTab(m.tab)
 	case "/":
-		if m.tab != tabRuns {
+		if m.tab == tabPRs || m.tab == tabIssues {
 			m.typing, m.draft = true, m.search[m.tab]
 		}
 	case "esc":
-		if m.tab != tabRuns && m.search[m.tab] != "" {
+		if (m.tab == tabPRs || m.tab == tabIssues) && m.search[m.tab] != "" {
 			m.search[m.tab], m.sel[m.tab] = "", 0
 			return m, m.refreshTab(m.tab)
 		}
 	case "enter":
+		if n, r, ok := m.inboxSelected(); ok {
+			return m, openNotification(n, r, false)
+		}
 		if m.tab == tabRuns {
 			if runs := m.runs(); m.sel[m.tab] < len(runs) {
 				return m, pushView(newRunView(m.repo, runs[m.sel[m.tab]].ID))
@@ -511,7 +653,20 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if it, ok := m.selected(); ok {
 			return m, pushView(newItemView(m.repo, it))
 		}
+	case "x":
+		if n, _, ok := m.inboxSelected(); ok {
+			id := n.ID
+			return m, func() tea.Msg {
+				if err := markDone(id); err != nil {
+					return actionMsg{err: err}
+				}
+				return actionMsg{text: "done: " + n.Title, refresh: true}
+			}
+		}
 	case "d":
+		if n, r, ok := m.inboxSelected(); ok && n.Kind == "PullRequest" && n.Number > 0 {
+			return m, openNotification(n, r, true)
+		}
 		if it, ok := m.selected(); ok && it.IsPR {
 			return m, pushView(newDiffView(m.repo, it.Number, it.Title))
 		}
@@ -525,6 +680,9 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.say("no open pull request for "+m.branch+" · n to create one", false)
 		}
 	case "o":
+		if n, _, ok := m.inboxSelected(); ok {
+			return m, openURL(n.URL)
+		}
 		if m.tab == tabRuns {
 			if runs := m.runs(); m.sel[m.tab] < len(runs) {
 				return m, openURL(runs[m.sel[m.tab]].URL)
@@ -552,7 +710,15 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "W":
 		if it, ok := m.selected(); ok && it.IsPR {
-			return m, worktreeCmd(m.repo, it.Number)
+			return m, worktreeCmd(m.repo, it.Number, it.HeadSHA)
+		}
+	case "w":
+		if it, ok := m.selected(); ok && it.IsPR && it.State == "OPEN" {
+			return m, pushView(workPicker(m.repo, it, nil))
+		}
+	case "J":
+		if it, ok := m.selected(); ok {
+			return m, focusAgent(it)
 		}
 	case "a":
 		if !inHerdr() {
@@ -594,24 +760,38 @@ func checkoutCmd(r Repo, number int) (tea.Cmd, string) {
 
 // worktreeCmd checks a pull request out in a worktree beside this checkout and, in Herdr, opens it as a workspace:
 // a place to run it or hand it to an agent without touching what you have checked out. An existing one is reused.
-func worktreeCmd(r Repo, number int) tea.Cmd {
+func worktreeCmd(r Repo, number int, sha string) tea.Cmd {
 	if r.Root == "" {
 		return func() tea.Msg { return actionMsg{err: errors.New("no checkout here to make a worktree from")} }
 	}
 	path := fmt.Sprintf("%s-pr-%d", r.Root, number)
-	script := fmt.Sprintf(`set -e
-p=%s
-if [ ! -d "$p" ]; then
-  git worktree add --detach "$p"
-  cd "$p" && gh pr checkout %d -R %s
-  cd - >/dev/null
-fi
-echo "worktree: $p"`, shellQuote(path), number, shellQuote(r.Slug))
+	script := worktreeScript(path, number, r.Slug, sha) + `
+echo "worktree: $p"`
 	if inHerdr() {
 		script += fmt.Sprintf("\n%s worktree open --cwd %s --path \"$p\" --focus >/dev/null && echo 'opened as a Herdr workspace'",
 			shellQuote(herdrBin()), shellQuote(r.Root))
 	}
 	return viewAction(fmt.Sprintf("worktree for #%d", number), r.Root, script, false)
+}
+
+// worktreeScript makes, or brings back, the worktree for a pull request at path. A worktree is right when it has the
+// pull request's head commit (sha; unknown when ""), its own commits on top allowed; one left half-made by a failed
+// checkout, or behind, gets gh pr checkout again, and the script fails if it still is not right.
+func worktreeScript(path string, number int, repo, sha string) string {
+	return fmt.Sprintf(`set -e
+p=%s
+sha=%s
+at_head() { [ -n "$sha" ] && git -C "$p" merge-base --is-ancestor "$sha" HEAD 2>/dev/null; }
+if [ ! -d "$p" ]; then
+  git worktree add --detach "$p"
+fi
+if ! at_head; then
+  (cd "$p" && gh pr checkout %d -R %s)
+fi
+if [ -n "$sha" ] && ! at_head; then
+  echo "the worktree at $p is not on the pull request's head ($sha)" >&2
+  exit 1
+fi`, shellQuote(path), shellQuote(sha), number, shellQuote(repo))
 }
 
 // itemPrompt asks an agent to take on a pull request or an issue. It names the item and points at gh for the rest
@@ -701,9 +881,23 @@ func (m model) View() string {
 			style = sTabOn
 		}
 		label := fmt.Sprintf("%d %s", i+1, name)
-		if i != tabRuns {
+		switch i {
+		case tabPRs, tabIssues:
 			if l, p := m.list(i); p != nil && p.val != nil {
 				label += fmt.Sprintf(" %d", l.Total)
+			}
+		case tabInbox:
+			unread := 0
+			for _, n := range m.inbox() {
+				if n.Unread {
+					unread++
+				}
+			}
+			if unread > 0 {
+				label += fmt.Sprintf(" %d", unread)
+				if len(m.inbox()) >= 50 && !m.inboxAll {
+					label += "+" // a page of them; there may be more
+				}
 			}
 		}
 		tabs = append(tabs, style.Render(label))
@@ -721,9 +915,12 @@ func (m model) View() string {
 	foot := m.footer()
 	bodyH := max(1, m.h-len(head)-lipgloss.Height(foot))
 	var body []string
-	if m.tab == tabRuns {
+	switch m.tab {
+	case tabRuns:
 		body = m.runRows(bodyH)
-	} else {
+	case tabInbox:
+		body = m.inboxRows(bodyH)
+	default:
 		body = m.itemRows(bodyH)
 	}
 	for len(body) < bodyH {
@@ -778,6 +975,12 @@ func (m model) filterLine() string {
 	var what string
 	var p *panel
 	switch m.tab {
+	case tabInbox:
+		what = "unread, from every repository"
+		if m.inboxAll {
+			what = "everything, from every repository"
+		}
+		p = m.panels[kInbox]
 	case tabRuns:
 		what = "all branches"
 		if m.runsMine {
@@ -872,8 +1075,118 @@ func (m model) itemRow(it Item, on bool) string {
 	if on {
 		style = style.Bold(true)
 	}
-	avail := m.w - lipgloss.Width(cursor+num+state) - lipgloss.Width(tail) - 3
-	return cursor + num + state + " " + style.Render(pad(truncate(title, max(8, avail)), max(8, avail))) + " " + tail
+	mark := ""
+	if a, ok := m.agents[it.Head]; ok && it.IsPR && it.State == "OPEN" {
+		mark = agentMark(a)
+	}
+	avail := m.w - lipgloss.Width(cursor+num+state+mark) - lipgloss.Width(tail) - 3
+	return cursor + num + state + " " + mark + style.Render(pad(truncate(title, max(8, avail)), max(8, avail))) + " " + tail
+}
+
+// inboxRows draws your notifications: unread first in weight, each with its repository, kind, and why it came.
+func (m model) inboxRows(h int) []string {
+	ns := m.inbox()
+	p := m.panels[kInbox]
+	var out []string
+	if p != nil && p.err != nil {
+		out = append(out, sBad.Render(" "+truncate(errText(p.err), m.w-2)))
+		h--
+	}
+	if len(ns) == 0 {
+		switch {
+		case p == nil || p.loading && p.val == nil:
+			return append(out, sMuted.Render(" loading…"))
+		case p.err == nil && m.inboxAll:
+			return append(out, sMuted.Render(" no notifications"))
+		case p.err == nil:
+			return append(out, sMuted.Render(" nothing unread · f shows everything"))
+		}
+		return out
+	}
+	sel := m.sel[tabInbox]
+	start := scrollStart(sel, len(ns), h)
+	repoW := 22
+	if m.w < 100 {
+		repoW = 14
+	}
+	for i := start; i < len(ns) && i < start+h; i++ {
+		n := ns[i]
+		cursor := "  "
+		if i == sel {
+			cursor = sTitle.Render("▸ ")
+		}
+		dot := "  "
+		title := lipgloss.NewStyle()
+		if n.Unread {
+			dot, title = sTitle.Render("● "), sBold
+		} else {
+			title = sMuted
+		}
+		left := cursor + dot + notificationKind(n.Kind) + " " + sMuted.Render(pad(truncate(n.Repo, repoW), repoW)) + " "
+		tail := sMuted.Render(pad(truncate(reasonWord(n.Reason), 10), 10) + " " + pad(age(n.Updated), 4))
+		avail := max(8, m.w-lipgloss.Width(left+tail)-2)
+		what := n.Title
+		if n.Number > 0 {
+			what = fmt.Sprintf("#%d %s", n.Number, n.Title)
+		}
+		out = append(out, left+title.Render(pad(truncate(what, avail), avail))+" "+tail)
+	}
+	return out
+}
+
+func notificationKind(kind string) string {
+	switch kind {
+	case "PullRequest":
+		return sGood.Render("PR")
+	case "Issue":
+		return sWarn.Render("IS")
+	case "Release":
+		return sMerged.Render("RL")
+	case "CheckSuite":
+		return sBad.Render("CI")
+	case "Discussion":
+		return sMuted.Render("DI")
+	}
+	return sMuted.Render("··")
+}
+
+// reasonWord is why a notification came, in a word or two.
+func reasonWord(r string) string {
+	switch r {
+	case "review_requested":
+		return "review"
+	case "mention", "team_mention":
+		return "mentioned"
+	case "assign":
+		return "assigned"
+	case "author":
+		return "yours"
+	case "ci_activity":
+		return "checks"
+	case "state_change":
+		return "state"
+	case "subscribed", "manual":
+		return "watching"
+	}
+	return strings.ReplaceAll(r, "_", " ")
+}
+
+// openNotification opens a notification's pull request or issue (its diff, with diff), whatever repository it is in,
+// and marks it read. Anything else opens on GitHub.
+func openNotification(n Notification, r Repo, diff bool) tea.Cmd {
+	read := func() tea.Msg {
+		if n.Unread {
+			_ = markRead(n.ID)
+		}
+		return refreshNowMsg{}
+	}
+	if n.Number == 0 || n.Kind != "PullRequest" && n.Kind != "Issue" {
+		return tea.Batch(openURL(n.URL), read)
+	}
+	if diff {
+		return tea.Batch(pushView(newDiffView(r, n.Number, n.Title)), read)
+	}
+	return tea.Batch(pushView(newItemView(r, Item{Number: n.Number, Title: n.Title, IsPR: n.Kind == "PullRequest", URL: n.URL})), read)
 }
 
 func (m model) runRows(h int) []string {
@@ -934,8 +1247,10 @@ func (m model) footer() string {
 		keys = append(keys, [2]string{"f", "filter"}, [2]string{"/", "search"})
 	case tabRuns:
 		keys = append(keys, [2]string{"f", "this branch"})
+	case tabInbox:
+		keys = append(keys, [2]string{"d", "diff"}, [2]string{"x", "done"}, [2]string{"f", "unread/all"}, [2]string{"o", "web"})
 	}
-	if inHerdr() && m.tab != tabRuns {
+	if inHerdr() && (m.tab == tabPRs || m.tab == tabIssues) {
 		keys = append(keys, [2]string{"a", "agent"})
 	}
 	keys = append(keys, [2]string{"?", "more"}, [2]string{"q", "quit"})
@@ -946,7 +1261,7 @@ func (m model) footer() string {
 		}
 		b.WriteString(sMuted.Render(fmt.Sprintf(" Interactive commands (gh pr create, checkout) open %s.", where)) + "\n")
 		keys = [][2]string{{"b", "your branch's PR"}, {"n", "new PR / issue"}, {"C", "check out PR"}, {"W", "PR in a worktree"},
-			{"o", "open on GitHub"}, {"r", "refresh"}, {"A", "gh sign in"}, {"1-3", "jump to list"}, {"?", "back"}}
+			{"o", "open on GitHub"}, {"r", "refresh"}, {"A", "gh sign in"}, {"1-4", "jump to list"}, {"?", "back"}}
 	}
 	b.WriteString(keyHelp(keys, m.w))
 	return b.String()

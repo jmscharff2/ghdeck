@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -77,9 +79,20 @@ type diffDataMsg struct {
 	id       int
 	files    []File
 	comments []ReviewComment
+	state    *ReviewState
 	sha      string
+	title    string
 	err      error
 }
+
+// sinceMsg brings what changed since your last review, for S.
+type sinceMsg struct {
+	id    int
+	files []File
+	err   error
+}
+
+func (m sinceMsg) viewID() int { return m.id }
 
 func (m diffDataMsg) viewID() int { return m.id }
 
@@ -94,21 +107,30 @@ type diffView struct {
 	files   []File
 	threads map[string][]thread // by path, then found by anchor
 	drafts  []DraftComment
+	state   *ReviewState // thread ids and resolution, files viewed, your last review; nil until loaded
 	loading bool
 	err     error
+
+	// since shows only what changed since your last review (S); all keeps the whole pull request meanwhile.
+	since        bool
+	sinceLoading bool
+	all          []File
 
 	file   int
 	cursor int // index into the file's lines
 	scroll int // first display row shown
 	wrap   bool
+	split  bool // old and new side by side, in a wide pane (s)
 	parsed map[int][]diffLine
+	hl     map[string]*highlighter // by path
 	ask    *confirmation
 	note   string
+	width  int // the last width drawn at
 }
 
 func newDiffView(r Repo, number int, title string) *diffView {
 	return &diffView{id: nextViewID(), repo: r, number: number, title: title, wrap: true, parsed: map[int][]diffLine{},
-		drafts: loadDrafts(r.Slug, number)}
+		hl: map[string]*highlighter{}, drafts: loadDrafts(r.Slug, number)}
 }
 
 func (v *diffView) ID() int          { return v.id }
@@ -121,7 +143,8 @@ func (v *diffView) fetch() tea.Cmd {
 	id, repo, n := v.id, v.repo.Slug, v.number
 	return func() tea.Msg {
 		var pr struct {
-			Head struct {
+			Title string `json:"title"`
+			Head  struct {
 				SHA string `json:"sha"`
 			} `json:"head"`
 		}
@@ -133,7 +156,11 @@ func (v *diffView) fetch() tea.Cmd {
 			return diffDataMsg{id: id, err: err}
 		}
 		comments, err := fetchReviewComments(repo, n)
-		return diffDataMsg{id: id, files: files, comments: comments, sha: clean(pr.Head.SHA), err: err}
+		if err != nil {
+			return diffDataMsg{id: id, err: err}
+		}
+		state, err := fetchReviewState(repo, n)
+		return diffDataMsg{id: id, files: files, comments: comments, state: state, sha: clean(pr.Head.SHA), title: clean(pr.Title), err: err}
 	}
 }
 
@@ -158,15 +185,41 @@ func (v *diffView) Update(msg tea.Msg) (bool, tea.Cmd) {
 		} else {
 			v.err = nil
 		}
+		if msg.state != nil {
+			v.state = msg.state
+		}
+		if msg.title != "" {
+			v.title = msg.title
+		}
 		if msg.files != nil {
-			changed := len(msg.files) != len(v.files) || msg.sha != v.sha
-			v.files, v.sha = msg.files, msg.sha
-			if changed {
-				v.parsed = map[int][]diffLine{}
-				v.file, v.cursor, v.scroll = min(v.file, max(0, len(v.files)-1)), 0, 0
+			if v.since && msg.sha != v.sha { // new commits: what changed since the review is out of date
+				v.since, v.all = false, nil
+				v.note = "new commits since you opened this · showing everything; S compares with your review again"
+			}
+			if v.since { // keep showing what changed since the review; the whole is for when S goes back
+				v.all = msg.files
+			} else {
+				changed := len(msg.files) != len(v.files) || msg.sha != v.sha
+				v.files, v.sha = msg.files, msg.sha
+				if changed {
+					v.parsed = map[int][]diffLine{}
+					v.file, v.cursor, v.scroll = min(v.file, max(0, len(v.files)-1)), 0, 0
+				}
 			}
 			v.threads = groupThreads(msg.comments)
 		}
+	case sinceMsg:
+		v.loading, v.sinceLoading = false, false
+		if msg.err != nil {
+			v.note = "can't compare with your last review: " + errText(msg.err)
+			return true, nil
+		}
+		if !v.since {
+			v.all = v.files
+		}
+		v.files, v.since = msg.files, true
+		v.parsed, v.file, v.cursor, v.scroll = map[int][]diffLine{}, 0, 0, 0
+		v.note = fmt.Sprintf("%d file(s) changed since your last review · S shows everything", len(v.files))
 	case draftDeleteMsg:
 		if msg.index < len(v.drafts) {
 			v.drafts = append(v.drafts[:msg.index:msg.index], v.drafts[msg.index+1:]...)
@@ -236,6 +289,14 @@ func (v *diffView) threadsAt(i int) ([]thread, []int) {
 	return ts, ds
 }
 
+// resolved says whether a thread is resolved, as far as the review state knows.
+func (v *diffView) resolved(t thread) bool {
+	return v.state != nil && v.state.Threads[t.root.ID].Resolved
+}
+
+// viewed says whether you ticked "Viewed" on a file.
+func (v *diffView) viewed(path string) bool { return v.state != nil && v.state.Viewed[path] }
+
 func (v *diffView) outdated() []thread {
 	var ts []thread
 	for _, t := range v.threads[v.path()] {
@@ -290,13 +351,27 @@ func (v *diffView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 		v.seekThread(-1)
 	case "w":
 		v.wrap = !v.wrap
+	case "s":
+		v.split = !v.split
+		if v.split && v.width > 0 && v.width < splitMin {
+			v.note = fmt.Sprintf("side by side needs a pane %d columns wide; this one is %d", splitMin, v.width)
+		}
 	case "f":
 		return true, pushView(v.filePicker())
 	case "r":
+		sharedRefresh()
 		return true, v.fetch()
 	case "o":
 		return true, openURL(fmt.Sprintf("https://github.com/%s/pull/%d/files", v.repo.Slug, v.number))
-	case "c":
+	case "z":
+		return true, v.toggleResolved()
+	case "V":
+		return true, v.toggleViewed()
+	case "S":
+		return true, v.toggleSince()
+	case "a":
+		return true, v.applySuggestion()
+	case "c", "C":
 		if v.cursor >= len(lines) {
 			return true, nil
 		}
@@ -306,8 +381,20 @@ func (v *diffView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 			v.note = "pick a line of code to comment on"
 			return true, nil
 		}
+		initial := ""
+		if msg.String() == "C" { // suggest a change: the line as it is, to edit into what it should be
+			if side != "RIGHT" {
+				v.note = "a suggestion replaces lines of the new file · pick an added or unchanged line"
+				return true, nil
+			}
+			initial = "```suggestion\n" + l.text + "\n```"
+		}
+		if v.since && side == "LEFT" {
+			v.note = "a removed line here is from your last review, not the base · S shows the whole diff to comment on it"
+			return true, nil
+		}
 		path := v.path()
-		c := newComposer(fmt.Sprintf("Comment on %s:%d", path, n), []string{codeLine(l, 0)}, "")
+		c := newComposer(fmt.Sprintf("Comment on %s:%d", path, n), []string{codeLine(l, 0)}, initial)
 		c.done = func(body string) tea.Cmd {
 			v.drafts = append(v.drafts, DraftComment{Path: path, Line: n, Side: side, Body: body})
 			return v.saveDrafts(fmt.Sprintf("drafted · %d comment(s) wait for v to send the review", len(v.drafts)))
@@ -362,6 +449,256 @@ func (v *diffView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 	return true, nil
 }
 
+// suggestionIn reads the lines a comment suggests, from its first suggestion block.
+func suggestionIn(body string) ([]string, bool) {
+	var out []string
+	in := false
+	for _, line := range strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n") {
+		t := strings.TrimSpace(line)
+		switch {
+		case !in && strings.HasPrefix(t, "```") && strings.TrimSpace(t[3:]) == "suggestion":
+			in = true
+		case in && strings.HasPrefix(t, "```"):
+			return out, true
+		case in:
+			out = append(out, line)
+		}
+	}
+	return nil, false
+}
+
+// applySuggestion writes the suggestion on the cursor's line into your checkout, after asking, when the checkout is
+// at the pull request's head and the lines still read as the diff shows them. It does not commit: that is yours.
+func (v *diffView) applySuggestion() tea.Cmd {
+	ts, _ := v.threadsAt(v.cursor)
+	var c *ReviewComment
+	for _, t := range ts {
+		// A suggestion replaces lines of the new file, so only a thread on that side has one to apply: the line
+		// numbers of a comment on a removed line are the base file's.
+		if or(t.root.Side, "RIGHT") != "RIGHT" || or(t.root.StartSide, "RIGHT") != "RIGHT" {
+			continue
+		}
+		for _, rc := range append([]ReviewComment{t.root}, t.replies...) {
+			if _, ok := suggestionIn(rc.Body); ok {
+				rc := rc
+				c = &rc
+			}
+		}
+	}
+	if c == nil {
+		v.note = "no suggested change to the new code on this line"
+		return nil
+	}
+	root := v.repo.Root
+	if root == "" {
+		v.note = "applying needs a checkout of this repository"
+		return nil
+	}
+	if out, err := runIn(root, "git", "rev-parse", "HEAD"); err != nil || strings.TrimSpace(string(out)) != v.sha {
+		v.note = "your checkout is not at this pull request's head · check it out first (C on the list or the pull request)"
+		return nil
+	}
+	path := v.path()
+	if _, err := runIn(root, "git", "diff", "--quiet", "HEAD", "--", path); err != nil {
+		v.note = path + " has changes you have not committed · commit or stash them first, so the lines match"
+		return nil
+	}
+	start, end := c.StartLine, v.threadLine(*c, ts)
+	if start == 0 {
+		start = end
+	}
+	// The lines as the diff shows them, which the file must still read as.
+	shown := map[int]string{}
+	for _, l := range v.lines() {
+		if l.kind == '+' || l.kind == ' ' {
+			shown[l.new] = l.text
+		}
+	}
+	var want []string
+	for n := start; n <= end; n++ {
+		t, ok := shown[n]
+		if !ok {
+			v.note = fmt.Sprintf("line %d is outside the diff, so ghdeck can't check it · apply this one on GitHub", n)
+			return nil
+		}
+		want = append(want, t)
+	}
+	v.ask = newConfirmation(fmt.Sprintf("Apply %s's suggestion to %s:%d-%d in your checkout?", c.User.Login, path, start, end),
+		func() tea.Msg {
+			if err := applySuggestion(root, path, start, end, want, c.Body); err != nil {
+				return actionMsg{err: err}
+			}
+			return actionMsg{text: fmt.Sprintf("applied to %s · commit and push it to send the change", path)}
+		})
+	return nil
+}
+
+// threadLine is where a comment's thread sits: a reply carries no line of its own, so it takes its thread's.
+func (v *diffView) threadLine(c ReviewComment, ts []thread) int {
+	if c.Line != 0 {
+		return c.Line
+	}
+	for _, t := range ts {
+		if t.root.ID == c.ReplyTo {
+			return t.root.Line
+		}
+	}
+	return 0
+}
+
+// applySuggestion replaces lines start through end of a file in the checkout with a comment's suggestion, when they
+// still read as want. The file is the pull request's, so its name is untrusted: it must be a plain file whose real
+// path, symlinks followed, is inside the checkout.
+func applySuggestion(root, path string, start, end int, want []string, body string) error {
+	repl, ok := suggestionIn(body)
+	if !ok {
+		return fmt.Errorf("no suggestion in the comment")
+	}
+	full := filepath.Join(root, filepath.FromSlash(path))
+	if rel, err := filepath.Rel(root, full); err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
+		return fmt.Errorf("%s is outside the checkout", path)
+	}
+	info, err := os.Lstat(full)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a plain file (a symlink, say), so ghdeck won't write it", path)
+	}
+	realRoot, err1 := filepath.EvalSymlinks(root)
+	realFull, err2 := filepath.EvalSymlinks(full)
+	if err1 != nil || err2 != nil {
+		return fmt.Errorf("can't resolve %s in the checkout", path)
+	}
+	if rel, err := filepath.Rel(realRoot, realFull); err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
+		return fmt.Errorf("%s leads outside the checkout", path)
+	}
+	b, err := os.ReadFile(full)
+	if err != nil {
+		return err
+	}
+	text := string(b)
+	trailing := strings.HasSuffix(text, "\n")
+	lines := strings.Split(strings.TrimSuffix(text, "\n"), "\n")
+	if start < 1 || end < start || end > len(lines) {
+		return fmt.Errorf("%s has %d lines; the suggestion is for %d-%d", path, len(lines), start, end)
+	}
+	for i, w := range want {
+		if strings.TrimRight(lines[start-1+i], "\r") != w {
+			return fmt.Errorf("%s:%d no longer reads as the diff shows it; nothing was changed", path, start+i)
+		}
+	}
+	out := append(append(append([]string{}, lines[:start-1]...), repl...), lines[end:]...)
+	text = strings.Join(out, "\n")
+	if trailing {
+		text += "\n"
+	}
+	return os.WriteFile(full, []byte(text), info.Mode().Perm())
+}
+
+// toggleResolved resolves the thread on the cursor's line, or opens it again.
+func (v *diffView) toggleResolved() tea.Cmd {
+	ts, _ := v.threadsAt(v.cursor)
+	if len(ts) == 0 {
+		v.note = "no thread on this line · t finds the next"
+		return nil
+	}
+	t := ts[len(ts)-1]
+	for _, c := range ts { // an open one first
+		if !v.resolved(c) {
+			t = c
+			break
+		}
+	}
+	var ts2 ThreadState
+	ok := false
+	if v.state != nil {
+		ts2, ok = v.state.Threads[t.root.ID]
+	}
+	if !ok {
+		v.note = "GitHub has not said which thread this is yet · r reloads"
+		return nil
+	}
+	resolve := !ts2.Resolved
+	ts2.Resolved = resolve
+	v.state.Threads[t.root.ID] = ts2 // shown at once; the reload after confirms it
+	text := "thread resolved"
+	if !resolve {
+		text = "thread opened again"
+	}
+	return func() tea.Msg {
+		if err := setResolved(ts2.ID, resolve); err != nil {
+			return actionMsg{err: err, refresh: true}
+		}
+		return actionMsg{text: text, refresh: true}
+	}
+}
+
+// toggleViewed ticks the file's "Viewed" box on GitHub, as its own page does, and moves on to the next file not
+// viewed yet.
+func (v *diffView) toggleViewed() tea.Cmd {
+	path := v.path()
+	if path == "" || v.state == nil || v.state.PRID == "" {
+		return nil
+	}
+	viewed := !v.state.Viewed[path]
+	v.state.Viewed[path] = viewed
+	prID := v.state.PRID
+	if viewed {
+		for i := 1; i < len(v.files); i++ {
+			if f := (v.file + i) % len(v.files); !v.viewed(v.files[f].Path) {
+				v.openFile(f)
+				break
+			}
+		}
+	}
+	n := 0
+	for _, f := range v.files {
+		if v.viewed(f.Path) {
+			n++
+		}
+	}
+	text := fmt.Sprintf("viewed · %d of %d files", n, len(v.files))
+	if !viewed {
+		text = "not viewed · " + path
+	}
+	return func() tea.Msg {
+		if err := setViewed(prID, path, viewed); err != nil {
+			return actionMsg{err: err}
+		}
+		return actionMsg{text: text}
+	}
+}
+
+// toggleSince shows only what changed since your last review, or the whole pull request again.
+func (v *diffView) toggleSince() tea.Cmd {
+	if v.since {
+		v.files, v.all, v.since = v.all, nil, false
+		v.parsed, v.file, v.cursor, v.scroll = map[int][]diffLine{}, 0, 0, 0
+		v.note = "the whole pull request"
+		return nil
+	}
+	switch {
+	case v.state == nil:
+		return nil
+	case v.state.LastReview == "":
+		v.note = "you have not reviewed this pull request yet"
+		return nil
+	case v.state.LastReview == v.sha:
+		v.note = "nothing new since your last review"
+		return nil
+	}
+	if v.sinceLoading {
+		return nil
+	}
+	v.loading, v.sinceLoading = true, true
+	id, repo, from, to := v.id, v.repo.Slug, v.state.LastReview, v.sha
+	return func() tea.Msg {
+		files, err := fetchFilesSince(repo, from, to)
+		return sinceMsg{id: id, files: files, err: err}
+	}
+}
+
 type draftDeleteMsg struct {
 	id    int
 	index int
@@ -400,16 +737,22 @@ func (v *diffView) seek(dir int, ok func(diffLine, int) bool) int {
 
 // seekThread moves to the next line with a thread or a draft, on to the next file when this one has no more.
 func (v *diffView) seekThread(dir int) {
+	// Resolved threads are done with; t skips them.
 	has := func(_ diffLine, i int) bool {
 		ts, ds := v.threadsAt(i)
-		return len(ts) > 0 || len(ds) > 0
+		for _, t := range ts {
+			if !v.resolved(t) {
+				return true
+			}
+		}
+		return len(ds) > 0
 	}
 	if i := v.seek(dir, has); i != v.cursor {
 		v.cursor = i
 		return
 	}
 	for f := v.file + dir; f >= 0 && f < len(v.files); f += dir {
-		if len(v.threads[v.files[f].Path]) == 0 && !v.hasDrafts(v.files[f].Path) {
+		if v.openThreads(v.files[f].Path) == 0 && !v.hasDrafts(v.files[f].Path) {
 			continue
 		}
 		v.openFile(f)
@@ -427,6 +770,17 @@ func (v *diffView) seekThread(dir int) {
 	v.note = "no more threads"
 }
 
+// openThreads counts a file's unresolved threads.
+func (v *diffView) openThreads(path string) int {
+	n := 0
+	for _, t := range v.threads[path] {
+		if !v.resolved(t) {
+			n++
+		}
+	}
+	return n
+}
+
 func (v *diffView) hasDrafts(path string) bool {
 	for _, d := range v.drafts {
 		if d.Path == path {
@@ -441,9 +795,14 @@ func (v *diffView) filePicker() *picker {
 	for i, f := range v.files {
 		i := i
 		label := fileStatusIcon(f.Status) + " " + f.Path
+		if v.viewed(f.Path) {
+			label = sGood.Render("✓ ") + label
+		} else {
+			label = "  " + label
+		}
 		detail := sGood.Render(fmt.Sprintf("+%d", f.Additions)) + sBad.Render(fmt.Sprintf(" −%d", f.Deletions))
-		if n := len(v.threads[f.Path]); n > 0 {
-			detail += sMuted.Render(fmt.Sprintf(" · %d thread(s)", n))
+		if n := v.openThreads(f.Path); n > 0 {
+			detail += sMuted.Render(fmt.Sprintf(" · %d open thread(s)", n))
 		}
 		if v.hasDrafts(f.Path) {
 			detail += sWarn.Render(" · drafts")
@@ -451,13 +810,14 @@ func (v *diffView) filePicker() *picker {
 		if f.Previous != "" {
 			detail += sMuted.Render(" · from " + f.Previous)
 		}
-		opts = append(opts, option{label: label, detail: detail, run: func() tea.Cmd {
+		opts = append(opts, option{label: label, match: f.Path, detail: detail, run: func() tea.Cmd {
 			v.openFile(i)
 			return nil
 		}})
 	}
 	p := newPicker(fmt.Sprintf("Files in #%d", v.number), opts)
 	p.sel = v.file
+	p.filterable = true
 	return p
 }
 
@@ -475,25 +835,46 @@ func fileStatusIcon(status string) string {
 
 // ---- drawing ----
 
-// row is one screen row of the diff, and the line it belongs to.
+// row is one screen row of the diff, and the line it belongs to: two, side by side, where a removed line faces the
+// line that replaced it.
 type row struct {
 	text string
 	line int
+	alt  int  // the other side's line, side by side; -1 when none
 	code bool // a row of the line itself, rather than of a thread under it
 }
+
+func (r row) has(i int) bool { return r.line == i || r.alt == i && r.alt >= 0 }
+
+// highlighter is the current file's, made on first use.
+func (v *diffView) highlighter() *highlighter {
+	p := v.path()
+	h, ok := v.hl[p]
+	if !ok {
+		h = newHighlighter(p)
+		v.hl[p] = h
+	}
+	return h
+}
+
+// splitMin is the narrowest pane that shows the diff side by side: two halves wide enough to read.
+const splitMin = 120
 
 const gutterW = 7 // "▸1234 +"
 
 // codeLine draws a diff line's gutter and text on one row, cut at w when w > 0.
-func codeLine(l diffLine, w int) string { return codeRows(l, w, false)[0] }
+func codeLine(l diffLine, w int) string { return codeRows(l, w, false, nil)[0] }
 
-func codeRows(l diffLine, w int, wrap bool) []string {
+// codeRows draws a diff line, wrapped to w or cut there, its code coloured by hl when hl knows the language. Added
+// and removed lines are tinted across the full width.
+func codeRows(l diffLine, w int, wrap bool, hl *highlighter) []string {
 	num := l.new
 	if l.kind == '-' {
 		num = l.old
 	}
 	text := strings.ReplaceAll(l.text, "\t", "    ")
-	var style lipgloss.Style
+	plain := hl == nil || hl.lexer == nil
+	var bg, fg lipgloss.TerminalColor
 	gutter := ""
 	switch l.kind {
 	case '@':
@@ -501,29 +882,44 @@ func codeRows(l diffLine, w int, wrap bool) []string {
 	case '\\':
 		return []string{sMuted.Render("        " + text)}
 	case '+':
-		style, gutter = sGood, sMuted.Render(fmt.Sprintf("%4d ", num))+sGood.Render("+")
+		bg, gutter = cAddBg, sMuted.Render(fmt.Sprintf("%4d ", num))+sGood.Render("+")
+		if plain {
+			fg = cGood
+		}
 	case '-':
-		style, gutter = sBad, sMuted.Render(fmt.Sprintf("%4d ", num))+sBad.Render("−")
+		bg, gutter = cDelBg, sMuted.Render(fmt.Sprintf("%4d ", num))+sBad.Render("−")
+		if plain {
+			fg = cBad
+		}
 	default:
-		style, gutter = lipgloss.NewStyle(), sMuted.Render(fmt.Sprintf("%4d  ", num))
+		gutter = sMuted.Render(fmt.Sprintf("%4d  ", num))
 	}
+	runs := hl.runs(text)
+	n := len([]rune(text))
 	avail := w - gutterW
+	fill := func(used int) string { // the tint carries on to the edge
+		if bg == nil || avail-used <= 0 {
+			return ""
+		}
+		return lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", avail-used))
+	}
 	if w <= 0 || avail < 10 {
-		return []string{gutter + " " + style.Render(text)}
+		return []string{gutter + " " + slice(runs, 0, n, bg, fg)}
 	}
 	if !wrap {
-		return []string{gutter + " " + style.Render(truncate(text, avail))}
+		if n > avail {
+			return []string{gutter + " " + slice(runs, 0, avail-1, bg, fg) + sMuted.Render("…")}
+		}
+		return []string{gutter + " " + slice(runs, 0, n, bg, fg) + fill(n)}
 	}
-	r := []rune(text)
 	var rows []string
-	for first := true; first || len(r) > 0; first = false {
-		n := min(avail, len(r))
+	for at := 0; at == 0 || at < n; at += avail {
 		lead := gutter + " "
-		if !first {
+		if at > 0 {
 			lead = strings.Repeat(" ", gutterW)
 		}
-		rows = append(rows, lead+style.Render(string(r[:n])))
-		r = r[n:]
+		end := min(n, at+avail)
+		rows = append(rows, lead+slice(runs, at, end, bg, fg)+fill(end-at))
 	}
 	return rows
 }
@@ -564,35 +960,129 @@ func (v *diffView) rows(w int) []row {
 	var out []row
 	lines := v.lines()
 	if od := v.outdated(); len(od) > 0 {
-		out = append(out, row{text: sMuted.Render(fmt.Sprintf(" %d outdated thread(s), on code that has changed since:", len(od))), line: -1})
+		out = append(out, row{text: sMuted.Render(fmt.Sprintf(" %d outdated thread(s), on code that has changed since:", len(od))), line: -1, alt: -1})
 		for _, t := range od {
-			out = append(out, row{text: "      " + sMuted.Render(fmt.Sprintf("line %d", t.root.Original)), line: -1})
+			out = append(out, row{text: "      " + sMuted.Render(fmt.Sprintf("line %d", t.root.Original)), line: -1, alt: -1})
 			for _, r := range threadRows(t, w) {
-				out = append(out, row{text: r, line: -1})
+				out = append(out, row{text: r, line: -1, alt: -1})
 			}
 		}
-		out = append(out, row{line: -1})
+		out = append(out, row{line: -1, alt: -1})
 	}
+	if v.split && w >= splitMin {
+		return append(out, v.splitRows(w)...)
+	}
+	hl := v.highlighter()
 	for i, l := range lines {
-		for _, r := range codeRows(l, w, v.wrap) {
-			out = append(out, row{text: r, line: i, code: true})
+		for _, r := range codeRows(l, w, v.wrap, hl) {
+			out = append(out, row{text: r, line: i, alt: -1, code: true})
 		}
+		out = append(out, v.notesRows(i, w)...)
+	}
+	return out
+}
+
+// notesRows draws the threads and drafts under line i.
+func (v *diffView) notesRows(i, w int) []row {
+	var out []row
+	{
 		ts, ds := v.threadsAt(i)
 		for _, t := range ts {
+			if v.resolved(t) { // folded to a line: done with, but still there
+				first, _, _ := strings.Cut(t.root.Body, "\n")
+				text := fmt.Sprintf("      %s %s · %s", sGood.Render("✓ resolved"), sMuted.Render(t.root.User.Login+": "+first),
+					sMuted.Render(plural(1+len(t.replies), "comment")+" · z opens it"))
+				out = append(out, row{text: truncStyledLine(text, w), line: i, alt: -1})
+				continue
+			}
 			for _, r := range threadRows(t, w) {
-				out = append(out, row{text: r, line: i})
+				out = append(out, row{text: r, line: i, alt: -1})
 			}
 		}
 		for _, j := range ds {
 			for _, r := range draftRows(v.drafts[j], w) {
-				out = append(out, row{text: r, line: i})
+				out = append(out, row{text: r, line: i, alt: -1})
 			}
 		}
 	}
 	return out
 }
 
+// splitRows lays the diff out side by side: the old file on the left, the new on the right. Within a change, the
+// removed lines face the added ones that replaced them; context lines face themselves.
+func (v *diffView) splitRows(w int) []row {
+	lines, hl := v.lines(), v.highlighter()
+	half := (w - 1) / 2
+	sep := sRule.Render("│")
+	var out []row
+	cell := func(i int, old bool) []string {
+		if i < 0 {
+			return []string{""}
+		}
+		l := lines[i]
+		if old { // a context line on the left goes by its number in the old file
+			l.new = l.old
+		}
+		return codeRows(l, half, v.wrap, hl)
+	}
+	pair := func(left, right int) {
+		l, r := cell(left, true), cell(right, false)
+		for k := 0; k < max(len(l), len(r)); k++ {
+			a, b := "", ""
+			if k < len(l) {
+				a = l[k]
+			}
+			if k < len(r) {
+				b = r[k]
+			}
+			line, alt := left, right
+			if line < 0 {
+				line, alt = right, -1
+			}
+			out = append(out, row{text: pad(truncStyledLine(a, half), half) + sep + truncStyledLine(b, half), line: line, alt: alt, code: true})
+		}
+		if left >= 0 {
+			out = append(out, v.notesRows(left, w)...)
+		}
+		if right >= 0 && right != left {
+			out = append(out, v.notesRows(right, w)...)
+		}
+	}
+	for i := 0; i < len(lines); {
+		switch lines[i].kind {
+		case '-', '+':
+			var dels, adds []int
+			for ; i < len(lines) && lines[i].kind == '-'; i++ {
+				dels = append(dels, i)
+			}
+			for ; i < len(lines) && lines[i].kind == '+'; i++ {
+				adds = append(adds, i)
+			}
+			for k := 0; k < max(len(dels), len(adds)); k++ {
+				left, right := -1, -1
+				if k < len(dels) {
+					left = dels[k]
+				}
+				if k < len(adds) {
+					right = adds[k]
+				}
+				pair(left, right)
+			}
+		case ' ':
+			pair(i, i)
+			i++
+		default: // a hunk header, or "no newline at end of file", across both
+			for _, r := range codeRows(lines[i], w, false, hl) {
+				out = append(out, row{text: r, line: i, alt: -1, code: true})
+			}
+			i++
+		}
+	}
+	return out
+}
+
 func (v *diffView) View(w, h int) string {
+	v.width = w
 	var head []string
 	title := fmt.Sprintf("#%d %s", v.number, v.title)
 	spin := ""
@@ -605,6 +1095,12 @@ func (v *diffView) View(w, h int) string {
 		where := fmt.Sprintf(" file %d/%d ", v.file+1, len(v.files))
 		stats := sGood.Render(fmt.Sprintf("+%d", f.Additions)) + sBad.Render(fmt.Sprintf(" −%d", f.Deletions))
 		line := sMuted.Render(where) + fileStatusIcon(f.Status) + " " + sBold.Render(f.Path) + "  " + stats
+		if v.viewed(f.Path) {
+			line += sGood.Render("  ✓ viewed")
+		}
+		if v.since {
+			line += sWarn.Render("  since your last review")
+		}
 		if n := len(v.drafts); n > 0 {
 			line += sWarn.Render(fmt.Sprintf("  %d draft(s)", n))
 		}
@@ -614,8 +1110,9 @@ func (v *diffView) View(w, h int) string {
 	}
 	head = append(head, sRule.Render(strings.Repeat("─", w)))
 
-	keys := [][2]string{{"↑↓", "line"}, {"n p", "file"}, {"f", "files"}, {"t", "next thread"}, {"c", "comment"},
-		{"R", "reply"}, {"v", "send review"}, {"w", "wrap"}, {"esc", "back"}}
+	keys := [][2]string{{"↑↓", "line"}, {"n p", "file"}, {"f", "files"}, {"V", "viewed"}, {"t", "next thread"},
+		{"c", "comment"}, {"C", "suggest"}, {"a", "apply suggestion"}, {"R", "reply"}, {"z", "resolve"}, {"S", "since review"}, {"v", "send review"}, {"s", "side by side"}, {"w", "wrap"},
+		{"esc", "back"}}
 	help := keyHelp(keys, w)
 	bodyH := max(1, h-len(head)-1-lipgloss.Height(help))
 	var body []string
@@ -631,7 +1128,7 @@ func (v *diffView) View(w, h int) string {
 		// Keep the cursor's line on screen, with room for the threads under it when they fit.
 		first, lastRow := -1, -1
 		for i, r := range rows {
-			if r.line == v.cursor {
+			if r.has(v.cursor) {
 				if first < 0 && r.code {
 					first = i
 				}
@@ -653,7 +1150,7 @@ func (v *diffView) View(w, h int) string {
 		for i := v.scroll; i < len(rows) && i < v.scroll+bodyH; i++ {
 			r := rows[i]
 			text := r.text
-			if r.code && r.line == v.cursor {
+			if r.code && r.has(v.cursor) {
 				text = sTitle.Render("▸") + strings.TrimPrefix(text, " ")
 				text = lipgloss.NewStyle().Background(cSelBg).Render(pad(truncStyledLine(text, w), w))
 			}
