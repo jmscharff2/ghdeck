@@ -77,6 +77,21 @@ Inside Herdr, ghdeck also:
   opens that as a Herdr workspace, and starts an agent there (Claude Code, Codex, or whichever is installed), or uses
   the one already in it. The prompt names the unresolved threads and failing checks, and you see it, and can edit it,
   first. Then ghdeck watches the pull request and tells you when the agent pushes and how the checks come out.
+- **puts each workspace's pull request in the sidebar**, as the `$gh_pr` token: `#482 ✓ approved` under every workspace
+  whose checkout or worktree is on that pull request's branch. It costs nothing extra from GitHub, and goes when ghdeck
+  does. Name it in a Space row in Herdr's `config.toml`, coloured by what it says:
+
+  ```toml
+  [ui.sidebar.spaces]
+  rows = [
+    ["state_icon", "workspace"],
+    ["branch", { token = "$gh_pr", rules = [
+      { contains = "✗", fg = "#ff6369" },
+      { contains = "◐", fg = "#f5a524" },
+      { contains = "✓", fg = "#4cc38a" },
+    ] }],
+  ]
+  ```
 - **shows which agent is on which pull request.** A pull request whose branch an agent in this repo has checked out
   is marked ◆ with the agent, coloured by whether it is working, waiting on you or done. `J` switches to its pane.
 - **hands work to an agent** (`a`): a pull request, an issue, failing checks or a failed run. It lists the agents

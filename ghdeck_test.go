@@ -581,3 +581,16 @@ func TestSharedAnswers(t *testing.T) {
 	gh.token = ""
 	gh.mu.Unlock()
 }
+
+func TestSidebarText(t *testing.T) {
+	for want, it := range map[string]Item{
+		"#1 ✗ checks":   {Number: 1, Checks: "FAILURE", Review: "APPROVED"}, // failing outranks approval
+		"#2 ✓ approved": {Number: 2, Checks: "SUCCESS", Review: "APPROVED"},
+		"#3 draft":      {Number: 3, Draft: true, Checks: "FAILURE"},
+		"#4 ◐ checks":   {Number: 4, Checks: "PENDING"},
+	} {
+		if got := sidebarText(it); got != want {
+			t.Errorf("sidebarText = %q, want %q", got, want)
+		}
+	}
+}

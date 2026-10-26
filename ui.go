@@ -122,6 +122,35 @@ func focusAgent(it Item) tea.Cmd {
 	}
 }
 
+// reportSidebar puts each of this repo's workspaces' pull request in Herdr's sidebar, from the open pull requests
+// ghdeck knows: the branch's, the watched ones, and the list's.
+func (m model) reportSidebar() tea.Cmd {
+	if !inHerdr() {
+		return nil
+	}
+	prs := map[string]Item{}
+	l, _ := m.list(tabPRs)
+	for _, it := range l.Items {
+		if it.State == "OPEN" && it.Head != "" {
+			prs[it.Head] = it
+		}
+	}
+	s := m.status()
+	for _, it := range s.Watched {
+		if it.State == "OPEN" {
+			prs[it.Head] = it
+		}
+	}
+	if s.BranchPR != nil {
+		prs[s.BranchPR.Head] = *s.BranchPR
+	}
+	r, ttl := m.repo, 3*pace(time.Minute)
+	return func() tea.Msg {
+		reportSidebar(r, prs, ttl)
+		return nil
+	}
+}
+
 // refreshAgents asks Herdr which agents are working in this repo, and on which branches. Nothing goes to GitHub.
 func (m model) refreshAgents() tea.Cmd {
 	if !inHerdr() || m.repo.Root == "" {
@@ -369,7 +398,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sel[m.tab] = max(0, n-1)
 		}
 		if msg.key == kStatus && msg.err == nil {
-			cmd := tea.Batch(m.announce(before), m.announceWatched(m.status()))
+			cmd := tea.Batch(m.announce(before), m.announceWatched(m.status()), m.reportSidebar())
 			if m.openBranch {
 				m.openBranch = false
 				if pr := m.status().BranchPR; pr != nil {
