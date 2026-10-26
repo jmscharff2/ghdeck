@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"sort"
@@ -743,4 +744,269 @@ func fetchRuns(repo, branch string) ([]Run, error) {
 		r.SHA, r.Event, r.Title, r.URL, r.Actor.Login = clean(r.SHA), clean(r.Event), clean(r.Title), clean(r.URL), clean(r.Actor.Login)
 	}
 	return resp.Runs, err
+}
+
+// ---- new pull requests ----
+
+type Branch struct {
+	Name string
+	SHA  string
+	Date time.Time // the tip commit's
+}
+
+// BranchInfo is what a new pull request chooses from: the branches, and where recent pull requests went, which says
+// how this repository works (straight to main, through develop, staging then main).
+type BranchInfo struct {
+	Default  string
+	Branches []Branch // the most recently committed to first; at most 100
+	Recent   []RecentPR
+}
+
+// RecentPR is one of the repository's latest pull requests, open or not: only which branch went where.
+type RecentPR struct {
+	Number     int
+	Head, Base string
+	Fork       bool
+}
+
+// usualBranches are the names teams give the branches work goes through. fetchBranches always looks for them, since a
+// busy repository's hundred most recent branches can leave out master itself.
+var usualBranches = []string{"main", "master", "develop", "development", "dev", "staging", "stage", "production", "prod",
+	"release", "rc", "next", "qa", "uat"}
+
+// fetchBranches lists the repository's branches, the most recently committed to first, then any usual ones that are
+// older; the default; and the branches of its last 50 pull requests. One query.
+func fetchBranches(repo string) (BranchInfo, error) {
+	owner, name, _ := strings.Cut(repo, "/")
+	var usual strings.Builder
+	for i, b := range usualBranches {
+		fmt.Fprintf(&usual, "u%d: ref(qualifiedName: %q) { name target { oid ... on Commit { committedDate } } }\n", i, "refs/heads/"+b)
+	}
+	q := `query($o: String!, $n: String!) {
+		repository(owner: $o, name: $n) {
+			defaultBranchRef { name }
+			refs(refPrefix: "refs/heads/", first: 100, orderBy: {field: TAG_COMMIT_DATE, direction: DESC}) {
+				nodes { name target { oid ... on Commit { committedDate } } }
+			}
+			pullRequests(first: 50, orderBy: {field: CREATED_AT, direction: DESC}) {
+				nodes { number headRefName baseRefName isCrossRepository }
+			}
+			` + usual.String() + `
+		}
+	}`
+	var resp struct {
+		Repository *struct {
+			Default *struct {
+				Name string `json:"name"`
+			} `json:"defaultBranchRef"`
+			Refs struct {
+				Nodes []struct {
+					Name   string `json:"name"`
+					Target struct {
+						OID  string    `json:"oid"`
+						Date time.Time `json:"committedDate"`
+					} `json:"target"`
+				} `json:"nodes"`
+			} `json:"refs"`
+			PRs struct {
+				Nodes []struct {
+					Number int    `json:"number"`
+					Head   string `json:"headRefName"`
+					Base   string `json:"baseRefName"`
+					Fork   bool   `json:"isCrossRepository"`
+				} `json:"nodes"`
+			} `json:"pullRequests"`
+		} `json:"repository"`
+	}
+	// The usual branches come back under aliases (u0, u1, …), so the answer is read twice: once for the fields the
+	// struct names, once for the aliases.
+	var data json.RawMessage
+	if err := ghQuery(q, map[string]any{"o": owner, "n": name}, &data); err != nil {
+		return BranchInfo{}, err
+	}
+	var raw struct {
+		Repository map[string]json.RawMessage `json:"repository"`
+	}
+	if json.Unmarshal(data, &resp) != nil || json.Unmarshal(data, &raw) != nil || resp.Repository == nil {
+		return BranchInfo{}, fmt.Errorf("GitHub has no repository %s that you can see", repo)
+	}
+	r := resp.Repository
+	var info BranchInfo
+	if r.Default != nil {
+		info.Default = clean(r.Default.Name)
+	}
+	for _, n := range r.Refs.Nodes {
+		info.Branches = append(info.Branches, Branch{Name: clean(n.Name), SHA: clean(n.Target.OID), Date: n.Target.Date})
+	}
+	listed := map[string]bool{}
+	for _, b := range info.Branches {
+		listed[b.Name] = true
+	}
+	for i := range usualBranches {
+		var ref *struct {
+			Name   string `json:"name"`
+			Target struct {
+				OID  string    `json:"oid"`
+				Date time.Time `json:"committedDate"`
+			} `json:"target"`
+		}
+		if b := raw.Repository[fmt.Sprintf("u%d", i)]; len(b) > 0 && json.Unmarshal(b, &ref) == nil && ref != nil && !listed[ref.Name] {
+			info.Branches = append(info.Branches, Branch{Name: clean(ref.Name), SHA: clean(ref.Target.OID), Date: ref.Target.Date})
+		}
+	}
+	for _, n := range r.PRs.Nodes {
+		info.Recent = append(info.Recent, RecentPR{Number: n.Number, Head: clean(n.Head), Base: clean(n.Base), Fork: n.Fork})
+	}
+	return info, nil
+}
+
+// fetchHeadHistory finds the last pull requests from one branch, however long ago: a branch promoted once a month
+// can be missing from the latest fifty.
+func fetchHeadHistory(repo, head string) ([]RecentPR, error) {
+	owner, name, _ := strings.Cut(repo, "/")
+	q := `query($o: String!, $n: String!, $h: String!) {
+		repository(owner: $o, name: $n) {
+			pullRequests(headRefName: $h, first: 5, orderBy: {field: CREATED_AT, direction: DESC}) {
+				nodes { number headRefName baseRefName isCrossRepository }
+			}
+		}
+	}`
+	var resp struct {
+		Repository *struct {
+			PRs struct {
+				Nodes []struct {
+					Number int    `json:"number"`
+					Head   string `json:"headRefName"`
+					Base   string `json:"baseRefName"`
+					Fork   bool   `json:"isCrossRepository"`
+				} `json:"nodes"`
+			} `json:"pullRequests"`
+		} `json:"repository"`
+	}
+	if err := ghQuery(q, map[string]any{"o": owner, "n": name, "h": head}, &resp); err != nil || resp.Repository == nil {
+		return nil, err
+	}
+	var out []RecentPR
+	for _, n := range resp.Repository.PRs.Nodes {
+		out = append(out, RecentPR{Number: n.Number, Head: clean(n.Head), Base: clean(n.Base), Fork: n.Fork})
+	}
+	return out, nil
+}
+
+// fetchBranch looks up one branch, for one past the hundred fetchBranches lists. ok is false when GitHub has none.
+func fetchBranch(repo, name string) (b Branch, ok bool, err error) {
+	var resp struct {
+		Name   string `json:"name"`
+		Commit struct {
+			SHA    string `json:"sha"`
+			Commit struct {
+				Committer struct {
+					Date time.Time `json:"date"`
+				} `json:"committer"`
+			} `json:"commit"`
+		} `json:"commit"`
+	}
+	if err := ghGet(fmt.Sprintf("repos/%s/branches/%s", repo, refPath(name)), &resp); err != nil {
+		if strings.HasPrefix(err.Error(), "GitHub: 404") {
+			return Branch{}, false, nil
+		}
+		return Branch{}, false, err
+	}
+	return Branch{Name: clean(resp.Name), SHA: clean(resp.Commit.SHA), Date: resp.Commit.Commit.Committer.Date}, true, nil
+}
+
+// Comparison is what merging head into base would bring.
+type Comparison struct {
+	Status             string // ahead, behind, diverged, identical
+	Ahead, Behind      int
+	Commits            []Commit // the oldest first, as GitHub lists them; at most 250
+	Files              int
+	Additions, Removed int
+	Open               *Item // an open pull request from head into base already
+}
+
+type Commit struct {
+	SHA, Subject, Body, Author string
+	Parents                    []string
+}
+
+// fetchComparison compares two branches, and looks for an open pull request between them.
+func fetchComparison(repo, base, head string) (*Comparison, error) {
+	var resp struct {
+		Status  string `json:"status"`
+		Ahead   int    `json:"ahead_by"`
+		Behind  int    `json:"behind_by"`
+		Commits []struct {
+			SHA    string `json:"sha"`
+			Commit struct {
+				Message string `json:"message"`
+				Author  struct {
+					Name string `json:"name"`
+				} `json:"author"`
+			} `json:"commit"`
+			Parents []struct {
+				SHA string `json:"sha"`
+			} `json:"parents"`
+		} `json:"commits"`
+		Files []struct {
+			Additions int `json:"additions"`
+			Deletions int `json:"deletions"`
+		} `json:"files"`
+	}
+	if err := ghGet(fmt.Sprintf("repos/%s/compare/%s...%s", repo, refPath(base), refPath(head)), &resp); err != nil {
+		return nil, err
+	}
+	c := &Comparison{Status: clean(resp.Status), Ahead: resp.Ahead, Behind: resp.Behind, Files: len(resp.Files)}
+	for _, f := range resp.Files {
+		c.Additions += f.Additions
+		c.Removed += f.Deletions
+	}
+	for _, rc := range resp.Commits {
+		subject, body, _ := strings.Cut(cleanBody(rc.Commit.Message), "\n")
+		cm := Commit{SHA: clean(rc.SHA), Subject: strings.TrimSpace(subject), Body: strings.TrimSpace(body),
+			Author: clean(rc.Commit.Author.Name)}
+		for _, p := range rc.Parents {
+			cm.Parents = append(cm.Parents, clean(p.SHA))
+		}
+		c.Commits = append(c.Commits, cm)
+	}
+	owner, _, _ := strings.Cut(repo, "/")
+	var open []struct {
+		Number int    `json:"number"`
+		Title  string `json:"title"`
+		URL    string `json:"html_url"`
+	}
+	path := fmt.Sprintf("repos/%s/pulls?state=open&base=%s&head=%s", repo, url.QueryEscape(base), url.QueryEscape(owner+":"+head))
+	if err := ghGet(path, &open); err != nil {
+		return nil, err
+	}
+	if len(open) > 0 {
+		o := open[0]
+		c.Open = &Item{Number: o.Number, Title: clean(o.Title), URL: clean(o.URL), IsPR: true, State: "OPEN", Head: head, Base: base}
+	}
+	return c, nil
+}
+
+// refPath escapes a branch name for a URL path, keeping the slashes that branch names use as separators.
+func refPath(branch string) string {
+	parts := strings.Split(branch, "/")
+	for i, p := range parts {
+		parts[i] = url.PathEscape(p)
+	}
+	return strings.Join(parts, "/")
+}
+
+// createPR opens a pull request from head into base, both branches of this repository.
+func createPR(repo, base, head, title, body string, draft bool) (Item, error) {
+	var resp struct {
+		Number int    `json:"number"`
+		Title  string `json:"title"`
+		URL    string `json:"html_url"`
+	}
+	payload := map[string]any{"base": base, "head": head, "title": title, "body": body, "draft": draft}
+	if err := ghWrite("POST", fmt.Sprintf("repos/%s/pulls", repo), payload, &resp); err != nil {
+		return Item{}, err
+	}
+	return Item{Number: resp.Number, Title: clean(resp.Title), URL: clean(resp.URL), IsPR: true, State: "OPEN",
+		Draft: draft, Head: head, Base: base}, nil
 }
