@@ -169,7 +169,8 @@ only, so a repository's file needs no trusting.
 
 | Key | Does |
 |---|---|
-| `tab` `shift+tab` `1`-`4` | pull requests, issues, Actions, your inbox |
+| `tab` `shift+tab` `1`-`4` | pull requests, issues, Actions, your inbox (or click a tab) |
+| mouse | click a row to choose it, again to open it; the wheel scrolls everywhere. Hold shift (option in some terminals) to select text |
 | `↑` `↓` `enter` | choose and open |
 | `f` | next filter (Actions: all branches, or this one; inbox: unread, or everything) |
 | `x` | inbox: mark the notification done |

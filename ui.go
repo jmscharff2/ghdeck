@@ -464,6 +464,8 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case execMsg:
 		return m, execHere(msg)
+	case tea.MouseMsg:
+		return m.mouse(msg)
 	case filterMsg:
 		m.filter[msg.tab], m.search[msg.tab], m.sel[msg.tab] = msg.filter, "", 0
 		return m, m.refreshTab(msg.tab)
@@ -898,8 +900,89 @@ func (m model) View() string {
 		}
 		return m.stack[n-1].View(m.w, m.h-1) + "\n" + toast
 	}
-	var head []string
-	tabs := []string{sTitle.Render("ghdeck") + " "}
+	head := m.headLines()
+	foot := m.footer()
+	bodyH := max(1, m.h-len(head)-lipgloss.Height(foot))
+	var body []string
+	switch m.tab {
+	case tabRuns:
+		body = m.runRows(bodyH)
+	case tabInbox:
+		body = m.inboxRows(bodyH)
+	default:
+		body = m.itemRows(bodyH)
+	}
+	for len(body) < bodyH {
+		body = append(body, "")
+	}
+	return strings.Join(head, "\n") + "\n" + strings.Join(body, "\n") + "\n" + foot
+}
+
+// mouse: the wheel scrolls whatever is on screen; on the lists, a click on a tab switches to it, a click on a row
+// chooses it, and a click on the chosen row opens it.
+func (m model) mouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if m.confirm != nil || m.typing {
+		return m, nil
+	}
+	if msg.Action == tea.MouseActionPress && (msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown) {
+		k := tea.KeyMsg{Type: tea.KeyDown}
+		if msg.Button == tea.MouseButtonWheelUp {
+			k = tea.KeyMsg{Type: tea.KeyUp}
+		}
+		var cmds []tea.Cmd
+		var next tea.Model = m
+		for i := 0; i < 3; i++ {
+			var cmd tea.Cmd
+			next, cmd = next.(model).update(k)
+			cmds = append(cmds, cmd)
+		}
+		return next, tea.Batch(cmds...)
+	}
+	if len(m.stack) > 0 || msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
+		return m, nil
+	}
+	if msg.Y == 0 {
+		x := 0
+		for i, piece := range m.tabPieces() {
+			w := lipgloss.Width(piece)
+			if i > 0 && msg.X >= x && msg.X < x+w {
+				return m.switchTab(i - 1)
+			}
+			x += w
+		}
+		return m, nil
+	}
+	row, ok := m.rowAt(msg.Y)
+	if !ok {
+		return m, nil
+	}
+	if row == m.sel[m.tab] {
+		return m.updateKey(tea.KeyMsg{Type: tea.KeyEnter})
+	}
+	m.sel[m.tab] = row
+	return m, nil
+}
+
+// rowAt is the list row drawn at screen line y, as View lays the list out.
+func (m model) rowAt(y int) (int, bool) {
+	head := m.headLines()
+	body := y - len(head)
+	bodyH := max(1, m.h-len(head)-lipgloss.Height(m.footer()))
+	key := map[int]string{tabPRs: kPRs, tabIssues: kIssues, tabRuns: kRuns, tabInbox: kInbox}[m.tab]
+	if p := m.panels[key]; p != nil && p.err != nil { // the error line above the rows
+		body, bodyH = body-1, bodyH-1
+	}
+	n := m.rows()
+	if body < 0 || body >= bodyH {
+		return 0, false
+	}
+	row := scrollStart(m.sel[m.tab], n, bodyH) + body
+	return row, row < n
+}
+
+// tabPieces is the first line, a piece at a time: the name, then each tab's label. Clicks are matched against them.
+func (m model) tabPieces() []string {
+	pieces := []string{sTitle.Render("ghdeck") + " "}
 	for i, name := range tabNames {
 		style := sTabOff
 		if i == m.tab {
@@ -925,9 +1008,15 @@ func (m model) View() string {
 				}
 			}
 		}
-		tabs = append(tabs, style.Render(label))
+		pieces = append(pieces, style.Render(label))
 	}
-	head = append(head, truncStyledLine(lipgloss.JoinHorizontal(lipgloss.Top, tabs...), m.w))
+	return pieces
+}
+
+// headLines is everything above the list.
+func (m model) headLines() []string {
+	var head []string
+	head = append(head, truncStyledLine(lipgloss.JoinHorizontal(lipgloss.Top, m.tabPieces()...), m.w))
 	head = append(head, truncStyledLine(m.statusLine(), m.w))
 	if m.authExpired() {
 		head = append(head, sBad.Render(" ⚠ gh login expired. Press A to sign in, then r."))
@@ -935,23 +1024,7 @@ func (m model) View() string {
 	if note := ghBudget(); note != "" {
 		head = append(head, sWarn.Render(" ⚠ "+note))
 	}
-	head = append(head, m.filterLine())
-
-	foot := m.footer()
-	bodyH := max(1, m.h-len(head)-lipgloss.Height(foot))
-	var body []string
-	switch m.tab {
-	case tabRuns:
-		body = m.runRows(bodyH)
-	case tabInbox:
-		body = m.inboxRows(bodyH)
-	default:
-		body = m.itemRows(bodyH)
-	}
-	for len(body) < bodyH {
-		body = append(body, "")
-	}
-	return strings.Join(head, "\n") + "\n" + strings.Join(body, "\n") + "\n" + foot
+	return append(head, m.filterLine())
 }
 
 // toast is the last action's result, shown for a few seconds over whatever view is on top.

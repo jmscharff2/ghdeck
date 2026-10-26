@@ -778,3 +778,33 @@ func TestSavedSearches(t *testing.T) {
 		t.Error("a broken config should be reported, with the presets still there")
 	}
 }
+
+// A click on a row chooses it, a second click opens it, a click on a tab switches to it, and the wheel scrolls.
+func TestMouse(t *testing.T) {
+	t.Setenv("HERDR_ENV", "")
+	m := newModel(Repo{Slug: "o/r"})
+	m.w, m.h = 120, 30
+	m.panels[kPRs] = &panel{val: List{Total: 3, Items: []Item{{Number: 1, IsPR: true}, {Number: 2, IsPR: true}, {Number: 3, IsPR: true}}}}
+	y := len(m.headLines()) + 2 // the third row
+	click := func(m model, x, y int) (model, tea.Cmd) {
+		next, cmd := m.Update(tea.MouseMsg{X: x, Y: y, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+		return next.(model), cmd
+	}
+	m, _ = click(m, 10, y)
+	if m.sel[tabPRs] != 2 {
+		t.Fatalf("a click should choose the row under it: chose %d", m.sel[tabPRs])
+	}
+	if _, cmd := click(m, 10, y); cmd == nil {
+		t.Error("a click on the chosen row should open it")
+	} else if _, ok := cmd().(pushViewMsg); !ok {
+		t.Error("opening should push the pull request's screen")
+	}
+	issuesX := lipgloss.Width(m.tabPieces()[0]) + lipgloss.Width(m.tabPieces()[1]) + 1
+	if m2, _ := click(m, issuesX, 0); m2.tab != tabIssues {
+		t.Errorf("a click on the Issues tab should switch to it: tab %d", m2.tab)
+	}
+	next, _ := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp})
+	if next.(model).sel[tabPRs] != 0 {
+		t.Errorf("the wheel should move the choice up: %d", next.(model).sel[tabPRs])
+	}
+}

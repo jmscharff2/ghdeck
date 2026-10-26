@@ -68,7 +68,7 @@ func main() {
 	m := newModel(r)
 	m.openBranch = *branchFlag
 	m.openTarget = target
-	if _, err := tea.NewProgram(m, tea.WithAltScreen()).Run(); err != nil {
+	if _, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion()).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "ghdeck:", err)
 		os.Exit(1)
 	}
