@@ -3,7 +3,7 @@
 
 id = "ghdeck"
 name = "ghdeck"
-version = "0.1.0"
+version = "0.2.0"
 # Plugin panes and actions, as tested; older releases may lack them.
 min_herdr_version = "0.9.3"
 description = "Pull requests, issues and Actions for the repo you are in: review diffs, comment, merge, and hand work to an agent"
