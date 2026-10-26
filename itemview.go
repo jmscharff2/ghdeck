@@ -221,6 +221,8 @@ func (v *itemView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 		if it.IsPR && it.State == "OPEN" && v.d != nil {
 			return true, pushView(workPicker(v.repo, it, v.d))
 		}
+	case "J":
+		return true, focusAgent(it)
 	case "a":
 		if inHerdr() {
 			return true, pushView(newAgentPicker(v.repo, itemPrompt(repo, it, v.d)))
@@ -386,7 +388,11 @@ func (v *itemView) headLines(w int) []string {
 	if v.d != nil {
 		meta = append(meta, "opened "+age(v.d.Created)+" ago")
 	}
-	lines = append(lines, truncStyledLine(" "+sMuted.Render(strings.Join(meta, " · ")), w))
+	metaLine := " " + sMuted.Render(strings.Join(meta, " · "))
+	if a, ok := agentsOn[it.Head]; ok && it.IsPR && it.State == "OPEN" {
+		metaLine += "  " + agentMark(a) + sMuted.Render(fmt.Sprintf("in pane %s · J goes there", a.Pane))
+	}
+	lines = append(lines, truncStyledLine(metaLine, w))
 	if v.d != nil && it.IsPR {
 		lines = append(lines, truncStyledLine(" "+prSummary(v.d), w))
 	}

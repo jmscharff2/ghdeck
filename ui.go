@@ -52,6 +52,9 @@ type actionMsg struct {
 
 type tickMsg struct{ gen int }
 
+// agentsMsg brings which agent is on which branch, from Herdr and local git.
+type agentsMsg map[string]agent
+
 // wakeMsg comes with the first key after ghdeck sat idle: refresh at once, and go back to the usual pace.
 type wakeMsg struct{}
 
@@ -82,7 +85,9 @@ type model struct {
 	stack   []subview
 	// watching is the pull requests handed to an agent with w, by number.
 	watching map[int]*watch
-	tickGen  int // which tick is current, so waking up does not leave a slow one running beside it
+	// agents is Herdr's agents in this repo, by the branch each has checked out.
+	agents  map[string]agent
+	tickGen int // which tick is current, so waking up does not leave a slow one running beside it
 
 	// openBranch opens the branch's pull request as soon as the first status says which it is.
 	openBranch bool
@@ -98,8 +103,36 @@ func newModel(r Repo) model {
 	return model{repo: r, branch: currentBranch(r.Root), panels: map[string]*panel{}}
 }
 
+// agentsOn is the latest agentsMsg, for views that show the agent on a branch. Only the UI goroutine touches it.
+var agentsOn map[string]agent
+
+// focusAgent switches Herdr to the agent working on a pull request's branch.
+func focusAgent(it Item) tea.Cmd {
+	a, ok := agentsOn[it.Head]
+	if !ok || !it.IsPR {
+		return func() tea.Msg {
+			return actionMsg{err: fmt.Errorf("no agent is on #%d's branch · w starts one", it.Number)}
+		}
+	}
+	return func() tea.Msg {
+		if _, err := run(herdrBin(), "agent", "focus", a.Pane); err != nil {
+			return actionMsg{err: fmt.Errorf("herdr agent focus: %w", err)}
+		}
+		return actionMsg{text: "switched to " + or(a.Kind, "the agent") + " in pane " + a.Pane}
+	}
+}
+
+// refreshAgents asks Herdr which agents are working in this repo, and on which branches. Nothing goes to GitHub.
+func (m model) refreshAgents() tea.Cmd {
+	if !inHerdr() || m.repo.Root == "" {
+		return nil
+	}
+	r := m.repo
+	return func() tea.Msg { return agentsMsg(agentsByBranch(r)) }
+}
+
 func (m model) Init() tea.Cmd {
-	cmds := []tea.Cmd{m.refreshStatus(), m.refreshTab(tabPRs), m.tick()}
+	cmds := []tea.Cmd{m.refreshStatus(), m.refreshTab(tabPRs), m.tick(), m.refreshAgents()}
 	if t := m.openTarget; t != nil {
 		cmds = append(cmds, pushView(t.view(m.repo)))
 	}
@@ -293,7 +326,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.branch = currentBranch(m.repo.Root)
-		cmds := []tea.Cmd{m.tick()}
+		cmds := []tea.Cmd{m.tick(), m.refreshAgents()}
 		// The header asks GraphQL too, so it keeps to a minute even while the list goes faster.
 		if p := m.panels[kStatus]; p == nil || !p.loading && time.Since(p.at) > pace(time.Minute)-5*time.Second {
 			cmds = append(cmds, m.refreshStatus())
@@ -358,6 +391,10 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case execMsg:
 		return m, execHere(msg)
+	case agentsMsg:
+		m.agents = msg
+		agentsOn = msg // for the pull request screen
+		return m, nil
 	case workStartedMsg:
 		if msg.err != nil {
 			m.say(errText(msg.err), true)
@@ -586,6 +623,10 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "w":
 		if it, ok := m.selected(); ok && it.IsPR && it.State == "OPEN" {
 			return m, pushView(workPicker(m.repo, it, nil))
+		}
+	case "J":
+		if it, ok := m.selected(); ok {
+			return m, focusAgent(it)
 		}
 	case "a":
 		if !inHerdr() {
@@ -905,8 +946,12 @@ func (m model) itemRow(it Item, on bool) string {
 	if on {
 		style = style.Bold(true)
 	}
-	avail := m.w - lipgloss.Width(cursor+num+state) - lipgloss.Width(tail) - 3
-	return cursor + num + state + " " + style.Render(pad(truncate(title, max(8, avail)), max(8, avail))) + " " + tail
+	mark := ""
+	if a, ok := m.agents[it.Head]; ok && it.IsPR && it.State == "OPEN" {
+		mark = agentMark(a)
+	}
+	avail := m.w - lipgloss.Width(cursor+num+state+mark) - lipgloss.Width(tail) - 3
+	return cursor + num + state + " " + mark + style.Render(pad(truncate(title, max(8, avail)), max(8, avail))) + " " + tail
 }
 
 func (m model) runRows(h int) []string {

@@ -77,6 +77,8 @@ Inside Herdr, ghdeck also:
   opens that as a Herdr workspace, and starts an agent there (Claude Code, Codex, or whichever is installed), or uses
   the one already in it. The prompt names the unresolved threads and failing checks, and you see it, and can edit it,
   first. Then ghdeck watches the pull request and tells you when the agent pushes and how the checks come out.
+- **shows which agent is on which pull request.** A pull request whose branch an agent in this repo has checked out
+  is marked ◆ with the agent, coloured by whether it is working, waiting on you or done. `J` switches to its pane.
 - **hands work to an agent** (`a`): a pull request, an issue, failing checks or a failed run. It lists the agents
   Herdr is running, the ones working in this repo first, and shows the prompt it will send, which `e` lets you edit
   first. If no agent fits, it can start Claude Code in a new pane.
@@ -136,6 +138,7 @@ a header for each step.
 | `W` | check it out in a worktree beside this checkout and, in Herdr, open that as a workspace |
 | `w` | work on it: the worktree, an agent in it with what is left to do, and news of its pushes and checks (Herdr) |
 | `a` | hand the pull request or issue to an agent (Herdr) |
+| `J` | switch to the agent working on the pull request's branch (Herdr) |
 | `o` | open on GitHub |
 | `A` | `gh auth login`, when the login has expired |
 | `r` `?` `q` | refresh, more keys, quit |
