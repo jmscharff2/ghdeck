@@ -319,7 +319,10 @@ type Detail struct {
 	Linked    []Item // pull requests that will close this issue
 	Methods   []string
 
-	CanEdit     bool   // you may change its title and description
+	CanEdit     bool // you may change its title and description
+	HasQueue    bool // its base branch merges through a merge queue
+	Queued      bool
+	QueuePos    int
 	AutoAllowed bool   // the repository lets pull requests merge themselves once they can
 	AutoMerge   string // the method set to merge with once checks and reviews allow, or ""
 	AutoBy      string
@@ -334,6 +337,7 @@ const detailQuery = `query($o: String!, $n: String!, $num: Int!) {
 				id number title state url body createdAt updatedAt isDraft headRefName baseRefName headRefOid viewerCanUpdate
 				reviewDecision additions deletions changedFiles mergeable mergeStateStatus isCrossRepository
 				autoMergeRequest { mergeMethod enabledBy { login } }
+				isInMergeQueue mergeQueueEntry { position } mergeQueue { id }
 				author { login }
 				comments { totalCount }
 				labels(first: 100) { nodes { name } }
@@ -473,6 +477,13 @@ func fetchDetail(repo string, number int) (*Detail, error) {
 					Method string   `json:"mergeMethod"`
 					By     gqlLogin `json:"enabledBy"`
 				} `json:"autoMergeRequest"`
+				Queued     bool `json:"isInMergeQueue"`
+				QueueEntry *struct {
+					Position int `json:"position"`
+				} `json:"mergeQueueEntry"`
+				Queue *struct {
+					ID string `json:"id"`
+				} `json:"mergeQueue"`
 				ReviewReqs struct {
 					Nodes []struct {
 						Reviewer *struct {
@@ -541,7 +552,7 @@ func fetchDetail(repo string, number int) (*Detail, error) {
 	d := &Detail{
 		Item: n.item(), ID: n.ID, Body: cleanBody(n.Body), Created: n.CreatedAt, HeadSHA: clean(n.HeadOID),
 		Changed: n.Changed, Mergeable: clean(n.Mergeable), MergeWhy: clean(n.MergeState), Fork: n.CrossRepo,
-		AutoAllowed: resp.Repository.Auto, CanEdit: n.CanUpdate,
+		AutoAllowed: resp.Repository.Auto, CanEdit: n.CanUpdate, HasQueue: n.Queue != nil, Queued: n.Queued,
 	}
 	for _, r := range n.ReviewReqs.Nodes {
 		if r.Reviewer != nil {
@@ -588,6 +599,9 @@ func fetchDetail(repo string, number int) (*Detail, error) {
 		d.Linked = append(d.Linked, Item{Number: c.Number, Title: clean(c.Title), State: clean(c.State), URL: clean(c.URL), IsPR: true})
 	}
 	r := resp.Repository
+	if e := r.Node.QueueEntry; e != nil {
+		d.QueuePos = e.Position
+	}
 	if a := r.Node.AutoMerge; a != nil {
 		d.AutoMerge, d.AutoBy = strings.ToLower(clean(a.Method)), clean(a.By.Login)
 	}
@@ -798,6 +812,16 @@ func updateBranch(prID, sha string, rebase bool) error {
 	return ghQuery(`mutation($id: ID!, $sha: GitObjectID!, $m: PullRequestBranchUpdateMethod!) {
 		updatePullRequestBranch(input: {pullRequestId: $id, expectedHeadOid: $sha, updateMethod: $m}) { clientMutationId } }`,
 		map[string]any{"id": prID, "sha": sha, "m": method}, nil)
+}
+
+// enqueue adds a pull request to its base branch's merge queue, if its head is still sha; dequeue takes it out.
+func enqueue(prID, sha string) error {
+	return ghQuery(`mutation($id: ID!, $sha: GitObjectID!) { enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $sha}) { clientMutationId } }`,
+		map[string]any{"id": prID, "sha": sha}, nil)
+}
+
+func dequeue(prID string) error {
+	return ghQuery(`mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }`, map[string]any{"id": prID}, nil)
 }
 
 // setAutoMerge has a pull request merge itself, by method, once its checks and reviews allow, if its head is still

@@ -351,8 +351,35 @@ func (v *itemView) mergePicker() *picker {
 	d, repo := v.d, v.repo.Slug
 	var opts []option
 	verbs := map[string]string{"squash": "Squash and merge", "merge": "Create a merge commit", "rebase": "Rebase and merge"}
+	// A merge queue merges pull requests in turn, each tested against the ones ahead of it.
+	switch {
+	case d.Queued:
+		opts = append(opts, option{label: "Take it out of the merge queue", detail: fmt.Sprintf("#%d in line", d.QueuePos),
+			run: func() tea.Cmd {
+				return func() tea.Msg {
+					if err := dequeue(d.ID); err != nil {
+						return actionMsg{err: err}
+					}
+					return actionMsg{text: fmt.Sprintf("#%d left the merge queue", d.Number), refresh: true}
+				}
+			}})
+	case d.HasQueue && !d.Draft:
+		opts = append(opts, option{label: "Add to the merge queue", detail: d.Base + " merges through a queue: it merges in turn once its checks pass",
+			run: func() tea.Cmd {
+				v.ask = newConfirmation(fmt.Sprintf("Add #%d to %s's merge queue?", d.Number, d.Base), func() tea.Msg {
+					if err := enqueue(d.ID, d.HeadSHA); err != nil {
+						return actionMsg{err: err}
+					}
+					return actionMsg{text: fmt.Sprintf("#%d is in the merge queue", d.Number), refresh: true}
+				})
+				v.ask.require = "merge"
+				return nil
+			}})
+	}
 	// Auto-merge: GitHub merges it once checks pass and reviews allow, so nobody has to wait to press the button.
-	if d.AutoMerge != "" {
+	if d.Queued {
+		// in the queue already: leaving it is the only thing to offer
+	} else if d.AutoMerge != "" {
 		opts = append(opts, option{label: "Stop merging it automatically", detail: "set by " + d.AutoBy + " to " + d.AutoMerge,
 			run: func() tea.Cmd {
 				return func() tea.Msg {
@@ -379,6 +406,9 @@ func (v *itemView) mergePicker() *picker {
 		}
 	}
 	for _, method := range d.Methods {
+		if d.Queued {
+			break // in the queue: leaving it is the only thing to do
+		}
 		for _, del := range []bool{false, true} {
 			if del && d.Fork {
 				continue // the branch is someone else's
@@ -555,6 +585,9 @@ func checksSummary(checks []Check) string {
 
 // mergeLine says whether the pull request can merge, and if not, why.
 func mergeLine(d *Detail) string {
+	if d.Queued {
+		return sGood.Render(fmt.Sprintf("in the merge queue, #%d", d.QueuePos)) + sMuted.Render(" · m to take it out")
+	}
 	if d.AutoMerge != "" {
 		return sGood.Render(fmt.Sprintf("merges itself (%s) once it can", d.AutoMerge)) + sMuted.Render(", set by "+d.AutoBy)
 	}
