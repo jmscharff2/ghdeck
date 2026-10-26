@@ -54,6 +54,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "ghdeck:", err)
 		os.Exit(1)
 	}
+	go sharedSweep()
 	m := newModel(r)
 	m.openBranch = *branchFlag
 	m.openTarget = target

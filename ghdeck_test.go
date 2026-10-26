@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -544,4 +545,39 @@ func TestAnnounceWatched(t *testing.T) {
 	if got := said(closed); len(got) != 1 || len(m.watching) != 0 {
 		t.Errorf("a merged pull request stops being watched: %q, %d left", got, len(m.watching))
 	}
+}
+
+// One deck's answer serves another while fresh; a stale one, or any after a write, does not.
+func TestSharedAnswers(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", "")
+	gh.mu.Lock()
+	gh.token = "token-a"
+	gh.mu.Unlock()
+	key := sharedKey([]byte(`{"query":"q"}`))
+	sharedPut(key, []byte(`{"data":{}}`))
+	if string(sharedGet(key)) != `{"data":{}}` {
+		t.Fatal("a fresh answer should be shared")
+	}
+	gh.mu.Lock()
+	gh.token = "token-b"
+	gh.mu.Unlock()
+	if sharedKey([]byte(`{"query":"q"}`)) == key {
+		t.Error("another account must not share the answer")
+	}
+	old := time.Now().Add(-time.Minute)
+	if err := os.Chtimes(filepath.Join(sharedDir(), key), old, old); err != nil {
+		t.Fatal(err)
+	}
+	if sharedGet(key) != nil {
+		t.Error("a stale answer should not be shared")
+	}
+	sharedPut(key, []byte(`{"data":{}}`))
+	sharedClear()
+	if sharedGet(key) != nil {
+		t.Error("a write should clear the shared answers")
+	}
+	gh.mu.Lock()
+	gh.token = ""
+	gh.mu.Unlock()
 }

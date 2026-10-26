@@ -359,9 +359,21 @@ func ghQuery(query string, vars map[string]any, v any) error {
 	if err != nil {
 		return err
 	}
-	out, err := gh.send("POST", gh.graphql, body)
-	if err != nil {
-		return err
+	mutation := strings.HasPrefix(strings.TrimSpace(query), "mutation")
+	key := ""
+	var out []byte
+	if !mutation {
+		key = sharedKey(body)
+		out = sharedGet(key)
+	}
+	fresh := out == nil
+	if fresh {
+		if out, err = gh.send("POST", gh.graphql, body); err != nil {
+			return err
+		}
+	}
+	if mutation {
+		sharedClear()
 	}
 	var resp struct {
 		Data   json.RawMessage `json:"data"`
@@ -387,6 +399,9 @@ func ghQuery(query string, vars map[string]any, v any) error {
 		}
 		return fmt.Errorf("GitHub: %s", clean(e.Message))
 	}
+	if fresh && key != "" {
+		sharedPut(key, out)
+	}
 	if v == nil { // a mutation whose answer nothing reads
 		return nil
 	}
@@ -403,6 +418,7 @@ func ghWrite(method, path string, payload, v any) error {
 		}
 	}
 	out, err := gh.send(method, gh.base+"/"+path, body)
+	sharedClear() // whatever changed, every deck should see it
 	if err != nil {
 		return err
 	}
