@@ -169,6 +169,7 @@ type option struct {
 	match  string // what typing filters on, in a filterable picker: the label when empty
 	run    func() tea.Cmd
 	on     bool // starts ticked, in a multi picker
+	hidden bool // listed only once typing finds it
 }
 
 type pickerLoadedMsg struct {
@@ -308,7 +309,13 @@ func (p *picker) Update(msg tea.Msg) (bool, tea.Cmd) {
 // shown is the options that match the filter.
 func (p *picker) shown() []option {
 	if p.filter == "" {
-		return p.opts
+		var out []option
+		for _, o := range p.opts {
+			if !o.hidden {
+				out = append(out, o)
+			}
+		}
+		return out
 	}
 	var out []option
 	f, exact := strings.ToLower(p.filter), false

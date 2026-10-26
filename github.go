@@ -794,6 +794,8 @@ type RecentPR struct {
 	Number     int
 	Head, Base string
 	Fork       bool
+	Merged     bool
+	HeadSHA    string // the head's commit when it was last updated, or merged
 }
 
 // usualBranches are the names teams give the branches work goes through. fetchBranches always looks for them, since a
@@ -816,7 +818,7 @@ func fetchBranches(repo string) (BranchInfo, error) {
 				nodes { name target { oid ... on Commit { committedDate } } }
 			}
 			pullRequests(first: 50, orderBy: {field: CREATED_AT, direction: DESC}) {
-				nodes { number headRefName baseRefName isCrossRepository }
+				nodes { number headRefName baseRefName isCrossRepository state headRefOid }
 			}
 			` + usual.String() + `
 		}
@@ -841,6 +843,8 @@ func fetchBranches(repo string) (BranchInfo, error) {
 					Head   string `json:"headRefName"`
 					Base   string `json:"baseRefName"`
 					Fork   bool   `json:"isCrossRepository"`
+					State  string `json:"state"`
+					OID    string `json:"headRefOid"`
 				} `json:"nodes"`
 			} `json:"pullRequests"`
 		} `json:"repository"`
@@ -882,7 +886,8 @@ func fetchBranches(repo string) (BranchInfo, error) {
 		}
 	}
 	for _, n := range r.PRs.Nodes {
-		info.Recent = append(info.Recent, RecentPR{Number: n.Number, Head: clean(n.Head), Base: clean(n.Base), Fork: n.Fork})
+		info.Recent = append(info.Recent, RecentPR{Number: n.Number, Head: clean(n.Head), Base: clean(n.Base), Fork: n.Fork,
+			Merged: n.State == "MERGED", HeadSHA: clean(n.OID)})
 	}
 	return info, nil
 }
@@ -894,7 +899,7 @@ func fetchHeadHistory(repo, head string) ([]RecentPR, error) {
 	q := `query($o: String!, $n: String!, $h: String!) {
 		repository(owner: $o, name: $n) {
 			pullRequests(headRefName: $h, first: 5, orderBy: {field: CREATED_AT, direction: DESC}) {
-				nodes { number headRefName baseRefName isCrossRepository }
+				nodes { number headRefName baseRefName isCrossRepository state headRefOid }
 			}
 		}
 	}`
@@ -906,6 +911,8 @@ func fetchHeadHistory(repo, head string) ([]RecentPR, error) {
 					Head   string `json:"headRefName"`
 					Base   string `json:"baseRefName"`
 					Fork   bool   `json:"isCrossRepository"`
+					State  string `json:"state"`
+					OID    string `json:"headRefOid"`
 				} `json:"nodes"`
 			} `json:"pullRequests"`
 		} `json:"repository"`
@@ -915,7 +922,8 @@ func fetchHeadHistory(repo, head string) ([]RecentPR, error) {
 	}
 	var out []RecentPR
 	for _, n := range resp.Repository.PRs.Nodes {
-		out = append(out, RecentPR{Number: n.Number, Head: clean(n.Head), Base: clean(n.Base), Fork: n.Fork})
+		out = append(out, RecentPR{Number: n.Number, Head: clean(n.Head), Base: clean(n.Base), Fork: n.Fork,
+			Merged: n.State == "MERGED", HeadSHA: clean(n.OID)})
 	}
 	return out, nil
 }

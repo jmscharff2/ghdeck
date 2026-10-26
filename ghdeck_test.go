@@ -482,3 +482,20 @@ func TestMultiPicker(t *testing.T) {
 		t.Errorf("ticked = %q", got)
 	}
 }
+
+func TestMergedBranches(t *testing.T) {
+	info := BranchInfo{Default: "main",
+		Branches: []Branch{{Name: "done", SHA: "aaa"}, {Name: "pushed-since", SHA: "new"}, {Name: "main", SHA: "m"}, {Name: "staging", SHA: "s"}},
+		Recent: []RecentPR{
+			{Number: 3, Head: "done", Base: "main", Merged: true, HeadSHA: "aaa"},
+			{Number: 2, Head: "pushed-since", Base: "main", Merged: true, HeadSHA: "old"},
+			{Number: 1, Head: "staging", Base: "main", Merged: true, HeadSHA: "s"}, // long-lived: never done with
+		}}
+	got := mergedBranches(info)
+	if len(got) != 1 || got["done"] != 3 {
+		t.Errorf("merged = %v, want only done (#3)", got)
+	}
+	if plural(2, "branch") != "2 branches" || plural(2, "file") != "2 files" {
+		t.Error("plural")
+	}
+}

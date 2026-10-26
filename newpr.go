@@ -20,6 +20,13 @@ func newPRFlow(r Repo, current string) *picker {
 	p := newPicker("New pull request · the branch to merge", nil)
 	p.filterable = true
 	var info BranchInfo // set by load; read once it has loaded
+	left := 0           // merged branches left out, the same
+	p.note = func(int) []string {
+		if p.loading || left == 0 {
+			return nil
+		}
+		return []string{sMuted.Render(fmt.Sprintf(" %s merged and unchanged since left out; typing finds them.", plural(left, "branch")))}
+	}
 	// Only a hundred branches are listed; any other can be named.
 	p.extra = func(typed string) []option {
 		return []option{{label: "use " + typed, detail: "a branch not listed here",
@@ -38,6 +45,8 @@ func newPRFlow(r Repo, current string) *picker {
 				opts = append(opts, o)
 			}
 		}
+		merged := mergedBranches(info)
+		hidden := 0
 		for _, b := range info.Branches {
 			if b.Name == current && current != info.Default {
 				continue
@@ -47,9 +56,15 @@ func newPRFlow(r Repo, current string) *picker {
 			if b.Name == info.Default {
 				detail += " · the default branch"
 			}
-			opts = append(opts, option{label: b.Name, match: b.Name, detail: detail,
-				run: func() tea.Cmd { return pushView(basePicker(r, info, b.Name)) }})
+			o := option{label: b.Name, match: b.Name, detail: detail,
+				run: func() tea.Cmd { return pushView(basePicker(r, info, b.Name)) }}
+			if n, ok := merged[b.Name]; ok { // done with: out of the way, but typing finds it
+				o.hidden, o.detail = true, detail+fmt.Sprintf(" · merged in #%d", n)
+				hidden++
+			}
+			opts = append(opts, o)
 		}
+		left = hidden
 		return opts, nil
 	}
 	return p
@@ -85,6 +100,27 @@ func currentOption(r Repo, info *BranchInfo, current string) (option, error) {
 	}
 	return option{label: current + sWarn.Render("  your branch, not pushed yet"), match: current,
 		detail: "gh pr create pushes it and asks the rest, in a pane", run: ghCreate}, nil
+}
+
+// mergedBranches finds branches done with: their last pull request merged, with nothing pushed since. It names the
+// pull request for each.
+func mergedBranches(info BranchInfo) map[string]int {
+	tip := map[string]string{}
+	for _, b := range info.Branches {
+		tip[b.Name] = b.SHA
+	}
+	ll := longLived(info)
+	out, seen := map[string]int{}, map[string]bool{}
+	for _, pr := range info.Recent { // the most recent first, so a branch's last pull request decides
+		if pr.Fork || seen[pr.Head] {
+			continue
+		}
+		seen[pr.Head] = true
+		if pr.Merged && !ll[pr.Head] && pr.HeadSHA != "" && tip[pr.Head] == pr.HeadSHA {
+			out[pr.Head] = pr.Number
+		}
+	}
+	return out
 }
 
 // longLived is the branches pull requests go into: the default, every recent base, and any with a usual name for one
@@ -188,9 +224,11 @@ func basePicker(r Repo, info BranchInfo, head string) *picker {
 		// The order guessBases reads them in; a repeat changes nothing.
 		withPast.Recent = append(append([]RecentPR{}, past...), info.Recent...)
 		var opts []option
+		merged := mergedBranches(withPast)
 		for _, c := range guessBases(withPast, head) {
 			base := c.name
-			opts = append(opts, option{label: base, match: base, detail: c.why,
+			_, done := merged[base]
+			opts = append(opts, option{label: base, match: base, detail: c.why, hidden: done,
 				run: func() tea.Cmd { return pushView(comparePicker(r, withPast, base, head)) }})
 		}
 		return opts, nil
@@ -442,6 +480,11 @@ func prTemplate(root string) string {
 func plural(n int, word string) string {
 	if n == 1 {
 		return "1 " + word
+	}
+	for _, end := range []string{"ch", "sh", "s", "x"} {
+		if strings.HasSuffix(word, end) {
+			return fmt.Sprintf("%d %ses", n, word)
+		}
 	}
 	return fmt.Sprintf("%d %ss", n, word)
 }
