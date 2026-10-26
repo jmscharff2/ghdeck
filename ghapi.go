@@ -341,6 +341,39 @@ func pace(every time.Duration) time.Duration {
 	return every
 }
 
+// Older GitHub Enterprise Servers lack fields github.com has, and a query that names one fails whole. A query that
+// uses newer fields names them in lean, each with what stands in for it ("" to leave it out): when GitHub says a
+// field does not exist, the query runs again lean, and stays lean from then on.
+var leanQueries sync.Map // name → true, once the server has refused a field
+
+type leanField struct{ full, lean string }
+
+func ghQueryLean(name, q string, lean []leanField, vars map[string]any, v any) error {
+	strip := func(q string) string {
+		for _, f := range lean {
+			q = strings.ReplaceAll(q, f.full, f.lean)
+		}
+		return q
+	}
+	if _, ok := leanQueries.Load(name); ok {
+		return ghQuery(strip(q), vars, v)
+	}
+	err := ghQuery(q, vars, v)
+	if err != nil && strings.Contains(err.Error(), "doesn't exist on type") {
+		leanQueries.Store(name, true)
+		return ghQuery(strip(q), vars, v)
+	}
+	return err
+}
+
+// flexID reads an id GitHub sends as a number or, for a BigInt, as a string.
+type flexID string
+
+func (f *flexID) UnmarshalJSON(b []byte) error {
+	*f = flexID(strings.Trim(string(b), `"`))
+	return nil
+}
+
 // forget drops cached responses under a path prefix, after a write that changes them.
 func (c *ghClient) forget(prefix string) {
 	c.mu.Lock()

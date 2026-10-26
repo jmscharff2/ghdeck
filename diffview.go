@@ -126,11 +126,35 @@ type diffView struct {
 	ask    *confirmation
 	note   string
 	width  int // the last width drawn at
+	mark   int // where a comment on several lines starts (m), or -1
+
+	// The rows drawn last, kept while nothing they show changes: drawing a big file's every row on each key is slow.
+	// changed counts changes to the threads, drafts and what is resolved.
+	changed int
+	cache   struct {
+		key  rowsKey
+		rows []row
+	}
+}
+
+type rowsKey struct {
+	file, w, changed int
+	wrap, split      bool
+	ok               bool
+}
+
+// cachedRows is rows(w), drawn again only when something it shows has changed.
+func (v *diffView) cachedRows(w int) []row {
+	k := rowsKey{file: v.file, w: w, changed: v.changed, wrap: v.wrap, split: v.split, ok: true}
+	if v.cache.key != k {
+		v.cache.key, v.cache.rows = k, v.rows(w)
+	}
+	return v.cache.rows
 }
 
 func newDiffView(r Repo, number int, title string) *diffView {
 	return &diffView{id: nextViewID(), repo: r, number: number, title: title, wrap: true, parsed: map[int][]diffLine{},
-		hl: map[string]*highlighter{}, drafts: loadDrafts(r.Slug, number)}
+		hl: map[string]*highlighter{}, drafts: loadDrafts(r.Slug, number), mark: -1}
 }
 
 func (v *diffView) ID() int          { return v.id }
@@ -180,6 +204,7 @@ func (v *diffView) Update(msg tea.Msg) (bool, tea.Cmd) {
 	switch msg := msg.(type) {
 	case diffDataMsg:
 		v.loading = false
+		v.changed++
 		if msg.err != nil {
 			v.err = msg.err
 		} else {
@@ -203,13 +228,14 @@ func (v *diffView) Update(msg tea.Msg) (bool, tea.Cmd) {
 				v.files, v.sha = msg.files, msg.sha
 				if changed {
 					v.parsed = map[int][]diffLine{}
-					v.file, v.cursor, v.scroll = min(v.file, max(0, len(v.files)-1)), 0, 0
+					v.file, v.cursor, v.scroll, v.mark = min(v.file, max(0, len(v.files)-1)), 0, 0, -1
 				}
 			}
 			v.threads = groupThreads(msg.comments)
 		}
 	case sinceMsg:
 		v.loading, v.sinceLoading = false, false
+		v.changed++
 		if msg.err != nil {
 			v.note = "can't compare with your last review: " + errText(msg.err)
 			return true, nil
@@ -218,9 +244,10 @@ func (v *diffView) Update(msg tea.Msg) (bool, tea.Cmd) {
 			v.all = v.files
 		}
 		v.files, v.since = msg.files, true
-		v.parsed, v.file, v.cursor, v.scroll = map[int][]diffLine{}, 0, 0, 0
+		v.parsed, v.file, v.cursor, v.scroll, v.mark = map[int][]diffLine{}, 0, 0, 0, -1
 		v.note = fmt.Sprintf("%d file(s) changed since your last review · S shows everything", len(v.files))
 	case draftDeleteMsg:
+		v.changed++
 		if msg.index < len(v.drafts) {
 			v.drafts = append(v.drafts[:msg.index:msg.index], v.drafts[msg.index+1:]...)
 		}
@@ -324,7 +351,21 @@ func (v *diffView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 	last := max(0, len(lines)-1)
 	switch msg.String() {
 	case "esc", "q":
+		if v.mark >= 0 && msg.String() == "esc" {
+			v.mark = -1
+			v.note = "range cleared"
+			return true, nil
+		}
 		return false, nil
+	case "m":
+		if v.cursor < len(lines) {
+			if _, n, ok := lines[v.cursor].anchor(); ok {
+				v.mark = v.cursor
+				v.note = fmt.Sprintf("from line %d · move to the last line, then c comments or C suggests · esc clears", n)
+				return true, nil
+			}
+		}
+		v.note = "mark a line of code"
 	case "down", "j":
 		v.cursor = min(last, v.cursor+1)
 	case "up", "k":
@@ -381,29 +422,71 @@ func (v *diffView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 			v.note = "pick a line of code to comment on"
 			return true, nil
 		}
-		initial := ""
-		if msg.String() == "C" { // suggest a change: the line as it is, to edit into what it should be
-			if side != "RIGHT" {
-				v.note = "a suggestion replaces lines of the new file · pick an added or unchanged line"
+		// From the mark, when there is one: a comment on every line between.
+		lo, hi := v.cursor, v.cursor
+		startLine, startSide := 0, ""
+		if v.mark >= len(lines) { // the diff changed under the mark
+			v.mark = -1
+		}
+		if v.mark >= 0 && v.mark != v.cursor {
+			lo, hi = min(v.mark, v.cursor), max(v.mark, v.cursor)
+			for i := lo; i <= hi; i++ {
+				if lines[i].kind == '@' {
+					v.note = "a comment on several lines stays within one hunk · m marks a new start"
+					return true, nil
+				}
+			}
+			s1, n1, ok1 := lines[lo].anchor()
+			s2, n2, ok2 := lines[hi].anchor()
+			if !ok1 || !ok2 || s1 != s2 {
+				v.note = "start and end on the same side: both in the new code, or both removed lines"
 				return true, nil
 			}
-			initial = "```suggestion\n" + l.text + "\n```"
+			l, side, n = lines[hi], s2, n2
+			startLine, startSide = n1, s1
+		}
+		initial := ""
+		if msg.String() == "C" { // suggest a change: the lines as they are, to edit into what they should be
+			if side != "RIGHT" {
+				v.note = "a suggestion replaces lines of the new file · pick added or unchanged lines"
+				return true, nil
+			}
+			var text []string
+			for i := lo; i <= hi; i++ {
+				if lines[i].kind == '+' || lines[i].kind == ' ' {
+					text = append(text, lines[i].text)
+				}
+			}
+			initial = "```suggestion\n" + strings.Join(text, "\n") + "\n```"
 		}
 		if v.since && side == "LEFT" {
 			v.note = "a removed line here is from your last review, not the base · S shows the whole diff to comment on it"
 			return true, nil
 		}
 		path := v.path()
-		c := newComposer(fmt.Sprintf("Comment on %s:%d", path, n), []string{codeLine(l, 0)}, initial)
+		where := fmt.Sprintf("%s:%d", path, n)
+		var context []string
+		for i := lo; i <= hi && len(context) < 8; i++ {
+			context = append(context, codeLine(lines[i], 0))
+		}
+		if startLine != 0 {
+			where = fmt.Sprintf("%s:%d-%d", path, startLine, n)
+		}
+		c := newComposer("Comment on "+where, context, initial)
 		c.done = func(body string) tea.Cmd {
-			v.drafts = append(v.drafts, DraftComment{Path: path, Line: n, Side: side, Body: body})
+			v.mark = -1
+			v.drafts = append(v.drafts, DraftComment{Path: path, Line: n, Side: side, Body: body, StartLine: startLine, StartSide: startSide})
 			return v.saveDrafts(fmt.Sprintf("drafted · %d comment(s) wait for v to send the review", len(v.drafts)))
 		}
 		return true, pushView(c)
 	case "e", "x":
-		_, ds := v.threadsAt(v.cursor)
+		ts, ds := v.threadsAt(v.cursor)
 		if len(ds) == 0 {
-			v.note = "no draft of yours on this line"
+			// No draft here: your comment already posted on this line, if there is one.
+			if c := v.yourComment(ts); c != nil {
+				return true, v.changePosted(*c, msg.String() == "x")
+			}
+			v.note = "no draft or comment of yours on this line"
 			return true, nil
 		}
 		j := ds[len(ds)-1]
@@ -442,11 +525,54 @@ func (v *diffView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 			return true, nil
 		}
 		return true, pushView(reviewPicker(v.repo.Slug, v.number, v.sha, append([]DraftComment(nil), v.drafts...), func(text string) tea.Cmd {
-			v.drafts = nil
+			v.drafts, v.changed = nil, v.changed+1
 			return tea.Batch(func() tea.Msg { return actionMsg{text: text, refresh: true} }, v.fetch())
 		}))
 	}
 	return true, nil
+}
+
+// inRange says a row's line is between the mark and the cursor.
+func (v *diffView) inRange(r row) bool {
+	lo, hi := min(v.mark, v.cursor), max(v.mark, v.cursor)
+	return r.line >= lo && r.line <= hi || r.alt >= lo && r.alt <= hi && r.alt >= 0
+}
+
+// yourComment finds your latest posted comment among a line's threads.
+func (v *diffView) yourComment(ts []thread) *ReviewComment {
+	if v.state == nil || v.state.Viewer == "" {
+		return nil
+	}
+	var found *ReviewComment
+	for _, t := range ts {
+		for _, c := range append([]ReviewComment{t.root}, t.replies...) {
+			if c.User.Login == v.state.Viewer && (found == nil || c.Created.After(found.Created)) {
+				c := c
+				found = &c
+			}
+		}
+	}
+	return found
+}
+
+// changePosted edits, or after asking deletes, a comment of yours already on GitHub.
+func (v *diffView) changePosted(c ReviewComment, del bool) tea.Cmd {
+	repo := v.repo.Slug
+	if del {
+		v.ask = newConfirmation("Delete your posted comment?", func() tea.Msg {
+			if err := deleteReviewComment(repo, c.ID); err != nil {
+				return actionMsg{err: err}
+			}
+			return actionMsg{text: "comment deleted", refresh: true}
+		})
+		return nil
+	}
+	comp := newComposer(fmt.Sprintf("Edit your comment on %s:%d", c.Path, c.Line), nil, forEditing(c.Raw))
+	comp.send = func(body string) error { return editReviewComment(repo, c.ID, body) }
+	comp.done = func(string) tea.Cmd {
+		return tea.Batch(func() tea.Msg { return actionMsg{text: "comment updated"} }, v.fetch())
+	}
+	return pushView(comp)
 }
 
 // suggestionIn reads the lines a comment suggests, from its first suggestion block.
@@ -621,6 +747,7 @@ func (v *diffView) toggleResolved() tea.Cmd {
 	}
 	resolve := !ts2.Resolved
 	ts2.Resolved = resolve
+	v.changed++
 	v.state.Threads[t.root.ID] = ts2 // shown at once; the reload after confirms it
 	text := "thread resolved"
 	if !resolve {
@@ -674,7 +801,8 @@ func (v *diffView) toggleViewed() tea.Cmd {
 func (v *diffView) toggleSince() tea.Cmd {
 	if v.since {
 		v.files, v.all, v.since = v.all, nil, false
-		v.parsed, v.file, v.cursor, v.scroll = map[int][]diffLine{}, 0, 0, 0
+		v.changed++
+		v.parsed, v.file, v.cursor, v.scroll, v.mark = map[int][]diffLine{}, 0, 0, 0, -1
 		v.note = "the whole pull request"
 		return nil
 	}
@@ -708,6 +836,7 @@ func (m draftDeleteMsg) viewID() int { return m.id }
 
 // saveDrafts writes the drafts at once, on the UI, so saves land in order and a review sent next has them all.
 func (v *diffView) saveDrafts(text string) tea.Cmd {
+	v.changed++
 	err := saveDrafts(v.repo.Slug, v.number, v.drafts)
 	return func() tea.Msg {
 		if err != nil {
@@ -721,7 +850,7 @@ func (v *diffView) openFile(i int) {
 	if i < 0 || i >= len(v.files) || i == v.file {
 		return
 	}
-	v.file, v.cursor, v.scroll = i, 0, 0
+	v.file, v.cursor, v.scroll, v.mark = i, 0, 0, -1
 }
 
 // seek finds the next line, forwards or backwards from the cursor, that ok accepts, or stays put.
@@ -949,7 +1078,11 @@ var sAccentBar = lipgloss.NewStyle().Foreground(cAccent).Render("┃")
 
 func draftRows(d DraftComment, w int) []string {
 	lead := "      " + sWarn.Render("┃") + " "
-	out := []string{lead + sWarn.Render("your draft · sent with the review (v) · e edit · x delete")}
+	what := "your draft"
+	if d.StartLine != 0 {
+		what = fmt.Sprintf("your draft on lines %d-%d", d.StartLine, d.Line)
+	}
+	out := []string{lead + sWarn.Render(what+" · sent with the review (v) · e edit · x delete")}
 	for _, l := range renderMarkdown(d.Body, w-10) {
 		out = append(out, lead+"  "+l)
 	}
@@ -1111,7 +1244,7 @@ func (v *diffView) View(w, h int) string {
 	head = append(head, sRule.Render(strings.Repeat("─", w)))
 
 	keys := [][2]string{{"↑↓", "line"}, {"n p", "file"}, {"f", "files"}, {"V", "viewed"}, {"t", "next thread"},
-		{"c", "comment"}, {"C", "suggest"}, {"a", "apply suggestion"}, {"R", "reply"}, {"z", "resolve"}, {"S", "since review"}, {"v", "send review"}, {"s", "side by side"}, {"w", "wrap"},
+		{"c", "comment"}, {"m", "mark range"}, {"C", "suggest"}, {"a", "apply suggestion"}, {"R", "reply"}, {"z", "resolve"}, {"S", "since review"}, {"v", "send review"}, {"s", "side by side"}, {"w", "wrap"},
 		{"esc", "back"}}
 	help := keyHelp(keys, w)
 	bodyH := max(1, h-len(head)-1-lipgloss.Height(help))
@@ -1124,7 +1257,7 @@ func (v *diffView) View(w, h int) string {
 	case v.file < len(v.files) && v.files[v.file].Patch == "":
 		body = []string{sMuted.Render(" No diff to show: the file is binary, or too large for GitHub to send. o opens it on GitHub.")}
 	default:
-		rows := v.rows(w)
+		rows := v.cachedRows(w)
 		// Keep the cursor's line on screen, with room for the threads under it when they fit.
 		first, lastRow := -1, -1
 		for i, r := range rows {
@@ -1150,6 +1283,9 @@ func (v *diffView) View(w, h int) string {
 		for i := v.scroll; i < len(rows) && i < v.scroll+bodyH; i++ {
 			r := rows[i]
 			text := r.text
+			if v.mark >= 0 && r.code && !r.has(v.cursor) && v.inRange(r) {
+				text = lipgloss.NewStyle().Background(cSelBg).Render(pad(truncStyledLine(text, w), w))
+			}
 			if r.code && r.has(v.cursor) {
 				text = sTitle.Render("▸") + strings.TrimPrefix(text, " ")
 				text = lipgloss.NewStyle().Background(cSelBg).Render(pad(truncStyledLine(text, w), w))

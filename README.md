@@ -72,7 +72,8 @@ command = "ghdeck.open"
 Inside Herdr, ghdeck also:
 
 - **opens GitHub links you ctrl+click** in any pane, an agent's output say: a pull request, its files, an issue, or an
-  Actions run opens in ghdeck over that pane, and `q` puts you back. (Herdr routes clicks to plugins while
+  Actions run opens in ghdeck over that pane, and `q` puts you back. Links on GitHub Enterprise work too when `GH_HOST`
+  names it; links on other hosts open in the browser as before. (Herdr routes clicks to plugins while
   `ui.mouse_capture` is on.)
 
 - **opens interactive commands in a pane below** (`gh issue create`, `gh pr create` for a branch not pushed yet,
@@ -146,16 +147,34 @@ handles forks.
 **A run.** Its jobs, with the chosen job's steps beneath it, live while it runs. `enter` streams the job's log with
 a header for each step.
 
+## Saved searches
+
+The filters `f` steps through can grow your own: any GitHub search, named. Put them in `~/.config/ghdeck/config.json`
+for every repository or for one, or, for a team, in `.ghdeck.json` at the top of the repository. They hold searches
+only, so a repository's file needs no trusting.
+
+```json
+{
+  "pull_requests": [{ "name": "my team", "query": "is:open team-review-requested:acme/web" }],
+  "issues": [{ "name": "needs QA", "query": "is:open label:qa" }],
+  "repos": {
+    "acme/web": { "pull_requests": [{ "name": "into release", "query": "is:open base:release" }] }
+  }
+}
+```
+
 ## Keys
 
 **Lists**
 
 | Key | Does |
 |---|---|
-| `tab` `shift+tab` `1`-`4` | pull requests, issues, Actions, your inbox |
+| `tab` `shift+tab` `1`-`4` | pull requests, issues, Actions, your inbox (or click a tab) |
+| mouse | click a row to choose it, again to open it; the wheel scrolls everywhere. Hold shift (option in some terminals) to select text |
 | `↑` `↓` `enter` | choose and open |
 | `f` | next filter (Actions: all branches, or this one; inbox: unread, or everything) |
 | `x` | inbox: mark the notification done |
+| `F` | every filter, presets and saved searches, to pick one (typing filters) |
 | `/` | search with GitHub's syntax; `esc` clears it |
 | `d` | the chosen pull request's diff |
 | `b` | your branch's pull request |
@@ -175,13 +194,16 @@ a header for each step.
 |---|---|
 | `↑` `↓` `pgup` `pgdn` `g` `G` | scroll |
 | `c` | comment |
+| `e` | edit the title and description (the first line is the title) |
+| `E` | your comments in the conversation, to edit or delete |
 | `d` `s` | the diff, every check (enter on an Actions check opens its run) |
 | `v` | review: comment, approve or request changes, with the diff's drafted line comments |
-| `m` | merge, by any method the repo allows, optionally deleting the branch, or set it to merge itself once checks pass and reviews allow (type `merge`) |
+| `m` | merge, by any method the repo allows, optionally deleting the branch, or set it to merge itself once checks pass and reviews allow, or add it to the merge queue where the branch has one (type `merge`) |
 | `D` | convert to draft, or mark ready for review |
 | `x` | close or reopen (type `yes`) |
 | `A` | assign yourself |
-| `R` | reviewers: GitHub's suggestions first, teams, and anyone who can be assigned (space ticks, typing filters) |
+| `R` | reviewers: GitHub's suggestions first, then those who reviewed already, to ask again after new commits, teams, and anyone who can be assigned (space ticks, typing filters) |
+| `u` | update the branch from its base: merge the base in, or rebase onto it (asks first) |
 | `L` | labels |
 | `C` `W` | check out here, or in a worktree |
 | `w` | work on it with an agent in its own worktree (Herdr) |
@@ -200,9 +222,10 @@ a header for each step.
 | `{` `}` | previous, next hunk |
 | `t` `T` | next, previous line with an open thread or a draft, across files |
 | `c` | draft a comment on this line |
-| `C` | suggest a change to this line: a draft that starts as the line, to edit into what it should be |
+| `m` | mark the first line of a comment on several lines; `c` or `C` on the last line covers them all (`esc` clears) |
+| `C` | suggest a change to this line, or the marked lines: a draft that starts as they are, to edit into what they should be |
 | `a` | apply the suggested change on this line to your checkout, when it is at the pull request's head (asks first; you commit) |
-| `e` `x` | edit, delete your draft on this line |
+| `e` `x` | edit, delete your draft on this line, or your comment already posted there (deleting asks first) |
 | `R` | reply to the thread on this line (posts at once) |
 | `z` | resolve the thread on this line, or open it again; resolved threads fold to a line |
 | `v` | send the review |
@@ -250,6 +273,7 @@ What it does not protect against: anything that already runs as you. A program t
 ```bash
 go test ./...
 GHDECK_LIVE=1 go test -run TestLive .    # reads a public repo through the real API
+GHDECK_WRITE=you/scratch go test -run TestWrites -v .   # every write, on a throwaway pull request it closes
 go build -o ghdeck . && ./ghdeck -R owner/name
 ```
 

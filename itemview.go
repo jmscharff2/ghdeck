@@ -154,6 +154,34 @@ func (v *itemView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 		if it.IsPR && v.d != nil && it.State == "OPEN" {
 			return true, pushView(v.mergePicker())
 		}
+	case "e":
+		if v.d == nil || !v.d.CanEdit {
+			return true, nil
+		}
+		d := v.d
+		what := "issue"
+		if it.IsPR {
+			what = "pull request"
+		}
+		c := newComposer(fmt.Sprintf("Edit #%d", d.Number), []string{sMuted.Render("The first line is the title; the rest is the description.")},
+			d.Title+"\n\n"+forEditing(d.Raw))
+		c.send = func(text string) error {
+			t, b, _ := strings.Cut(text, "\n")
+			if t = strings.TrimSpace(t); t == "" {
+				return fmt.Errorf("the first line is the title: write one")
+			}
+			return editItem(d.ID, d.IsPR, t, strings.TrimSpace(b))
+		}
+		c.done = func(string) tea.Cmd { return v.after(what + " updated") }
+		return true, pushView(c)
+	case "E":
+		if v.d != nil {
+			return true, pushView(v.commentsPicker())
+		}
+	case "u":
+		if it.IsPR && v.d != nil && it.State == "OPEN" {
+			return true, pushView(v.updatePicker())
+		}
 	case "D":
 		if it.IsPR && v.d != nil && it.State == "OPEN" {
 			id, draft := v.d.ID, !it.Draft
@@ -245,14 +273,114 @@ func (v *itemView) after(text string) tea.Cmd {
 	return tea.Batch(func() tea.Msg { return actionMsg{text: text} }, v.fetch())
 }
 
+// commentsPicker lists your comments in the conversation, to edit or delete one.
+func (v *itemView) commentsPicker() *picker {
+	var opts []option
+	for i := len(v.d.Events) - 1; i >= 0; i-- { // the newest first
+		e := v.d.Events[i]
+		// Maintainers may change anyone's comments; this lists only yours.
+		if e.Kind != "comment" || e.Author != v.d.Viewer || !e.CanEdit && !e.CanDelete {
+			continue
+		}
+		first, _, _ := strings.Cut(e.Body, "\n")
+		opts = append(opts, option{label: truncate(first, 70), detail: age(e.At) + " ago", run: func() tea.Cmd { return pushView(v.commentPicker(e)) }})
+	}
+	p := newPicker(fmt.Sprintf("Your comments on #%d", v.d.Number), opts)
+	if len(opts) == 0 {
+		p.note = func(int) []string { return []string{sMuted.Render(" You have no comments here to change.")} }
+	}
+	return p
+}
+
+// commentPicker edits or deletes one comment.
+func (v *itemView) commentPicker(e Event) *picker {
+	var opts []option
+	if e.CanEdit {
+		opts = append(opts, option{label: "Edit", run: func() tea.Cmd {
+			c := newComposer("Edit your comment", nil, forEditing(e.Raw))
+			c.send = func(body string) error { return editComment(e.ID, body) }
+			c.done = func(string) tea.Cmd { return v.after("comment updated") }
+			return pushView(c)
+		}})
+	}
+	if e.CanDelete {
+		opts = append(opts, option{label: "Delete", detail: "asks first", run: func() tea.Cmd {
+			v.ask = newConfirmation("Delete your comment?", func() tea.Msg {
+				if err := deleteComment(e.ID); err != nil {
+					return actionMsg{err: err}
+				}
+				return actionMsg{text: "comment deleted", refresh: true}
+			})
+			return nil
+		}})
+	}
+	first, _, _ := strings.Cut(e.Body, "\n")
+	return newPicker("Your comment: "+truncate(first, 50), opts)
+}
+
+// updatePicker brings the base branch's new commits into the pull request's branch, by merging or by rebasing.
+// Either pushes to the branch, so it asks first.
+func (v *itemView) updatePicker() *picker {
+	d := v.d
+	choice := func(label, detail string, rebase bool) option {
+		return option{label: label, detail: detail, run: func() tea.Cmd {
+			v.ask = newConfirmation(fmt.Sprintf("%s #%d's branch %s?", label, d.Number, d.Head), func() tea.Msg {
+				if err := updateBranch(d.ID, d.HeadSHA, rebase); err != nil {
+					return actionMsg{err: err}
+				}
+				return actionMsg{text: fmt.Sprintf("updating %s from %s · checks run again", d.Head, d.Base), refresh: true}
+			})
+			return nil
+		}}
+	}
+	p := newPicker(fmt.Sprintf("Update #%d with %s", d.Number, d.Base), []option{
+		choice("Merge "+d.Base+" into", "a merge commit on "+d.Head+"; history stays as it is", false),
+		choice("Rebase onto "+d.Base, "rewrites "+d.Head+"'s commits: anyone else's checkout of it will need a reset", true),
+	})
+	p.note = func(int) []string {
+		if d.MergeWhy == "BEHIND" {
+			return []string{" " + sWarn.Render(d.Head+" is behind "+d.Base) + sMuted.Render(", and the branch rules want it up to date to merge.")}
+		}
+		return []string{sMuted.Render(" " + d.Head + " gets " + d.Base + "'s latest commits.")}
+	}
+	return p
+}
+
 // mergePicker offers the merge methods the repository allows, the one you used last first, each with and without
 // deleting the branch. The merge itself still asks for a typed word.
 func (v *itemView) mergePicker() *picker {
 	d, repo := v.d, v.repo.Slug
 	var opts []option
 	verbs := map[string]string{"squash": "Squash and merge", "merge": "Create a merge commit", "rebase": "Rebase and merge"}
+	// A merge queue merges pull requests in turn, each tested against the ones ahead of it.
+	switch {
+	case d.Queued:
+		opts = append(opts, option{label: "Take it out of the merge queue", detail: fmt.Sprintf("#%d in line", d.QueuePos),
+			run: func() tea.Cmd {
+				return func() tea.Msg {
+					if err := dequeue(d.ID); err != nil {
+						return actionMsg{err: err}
+					}
+					return actionMsg{text: fmt.Sprintf("#%d left the merge queue", d.Number), refresh: true}
+				}
+			}})
+	case d.HasQueue && !d.Draft:
+		opts = append(opts, option{label: "Add to the merge queue", detail: d.Base + " merges through a queue: it merges in turn once its checks pass",
+			run: func() tea.Cmd {
+				v.ask = newConfirmation(fmt.Sprintf("Add #%d to %s's merge queue?", d.Number, d.Base), func() tea.Msg {
+					if err := enqueue(d.ID, d.HeadSHA); err != nil {
+						return actionMsg{err: err}
+					}
+					return actionMsg{text: fmt.Sprintf("#%d is in the merge queue", d.Number), refresh: true}
+				})
+				v.ask.require = "merge"
+				return nil
+			}})
+	}
 	// Auto-merge: GitHub merges it once checks pass and reviews allow, so nobody has to wait to press the button.
-	if d.AutoMerge != "" {
+	if d.Queued {
+		// in the queue already: leaving it is the only thing to offer
+	} else if d.AutoMerge != "" {
 		opts = append(opts, option{label: "Stop merging it automatically", detail: "set by " + d.AutoBy + " to " + d.AutoMerge,
 			run: func() tea.Cmd {
 				return func() tea.Msg {
@@ -279,6 +407,9 @@ func (v *itemView) mergePicker() *picker {
 		}
 	}
 	for _, method := range d.Methods {
+		if d.HasQueue {
+			break // the branch merges through its queue: the queue is the way in, or out
+		}
 		for _, del := range []bool{false, true} {
 			if del && d.Fork {
 				continue // the branch is someone else's
@@ -455,6 +586,9 @@ func checksSummary(checks []Check) string {
 
 // mergeLine says whether the pull request can merge, and if not, why.
 func mergeLine(d *Detail) string {
+	if d.Queued {
+		return sGood.Render(fmt.Sprintf("in the merge queue, #%d", d.QueuePos)) + sMuted.Render(" · m to take it out")
+	}
 	if d.AutoMerge != "" {
 		return sGood.Render(fmt.Sprintf("merges itself (%s) once it can", d.AutoMerge)) + sMuted.Render(", set by "+d.AutoBy)
 	}
@@ -466,7 +600,7 @@ func mergeLine(d *Detail) string {
 	case d.MergeWhy == "CLEAN" || d.MergeWhy == "HAS_HOOKS":
 		return sGood.Render("ready to merge")
 	case d.MergeWhy == "BEHIND":
-		return sWarn.Render("behind " + d.Base)
+		return sWarn.Render("behind " + d.Base + " · u updates it")
 	case d.MergeWhy == "BLOCKED":
 		return sWarn.Render("blocked by branch rules")
 	case d.MergeWhy == "UNSTABLE":
@@ -652,6 +786,9 @@ func (v *itemView) footer(w int) string {
 		keys = append(keys, [2]string{"d", "diff"}, [2]string{"v", "review"}, [2]string{"s", "checks"})
 		if it.State == "OPEN" {
 			keys = append(keys, [2]string{"m", "merge"}, [2]string{"R", "reviewers"}, [2]string{"D", "draft/ready"})
+			if v.d != nil && v.d.MergeWhy == "BEHIND" {
+				keys = append(keys, [2]string{"u", "update branch"})
+			}
 		}
 		keys = append(keys, [2]string{"C", "checkout"}, [2]string{"W", "worktree"})
 		if inHerdr() && it.State == "OPEN" {
@@ -661,6 +798,10 @@ func (v *itemView) footer(w int) string {
 		keys = append(keys, [2]string{"A", "assign me"})
 	}
 	keys = append(keys, [2]string{"L", "labels"})
+	if v.d != nil && v.d.CanEdit {
+		keys = append(keys, [2]string{"e", "edit"})
+	}
+	keys = append(keys, [2]string{"E", "your comments"})
 	if it.State != "MERGED" {
 		word := "close"
 		if it.State == "CLOSED" {

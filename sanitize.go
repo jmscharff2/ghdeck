@@ -50,6 +50,26 @@ func sanitize(s string, keepTabs bool) string {
 	return b.String()
 }
 
+// forEditing is text as it was written, for the editor to start from, so saving changes only what you changed: tabs,
+// bidirectional marks and the rest stay. Only what could act on the terminal goes (escape sequences, and control
+// characters other than tab and newline), and text with none of that comes through untouched.
+func forEditing(s string) string {
+	s = strings.ToValidUTF8(s, "\ufffd")
+	s = escapeSequence.ReplaceAllString(s, "")
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '\t', r == '\n':
+			b.WriteRune(r)
+		case r == '\r', r < 0x20, r == 0x7f, r >= 0x80 && r <= 0x9f:
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 // isPlain is the fast path: printable ASCII needs no work.
 func isPlain(s string) bool {
 	for i := 0; i < len(s); i++ {

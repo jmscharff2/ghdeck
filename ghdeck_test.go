@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -702,4 +703,171 @@ func TestMultiPickerKeepsWhatItDidNotOffer(t *testing.T) {
 	failed := newMultiPicker("Labels", []string{"bug"}, func([]string) tea.Cmd { t.Error("applied after a failed load"); return nil })
 	failed.Update(pickerLoadedMsg{id: failed.id, err: errors.New("rate limited")})
 	failed.Update(tea.KeyMsg{Type: tea.KeyEnter})
+}
+
+// m marks the first line; C on the last drafts a suggestion for all of them, starting from their text.
+func TestMultiLineSuggestion(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // drafts are saved to the cache directory
+	t.Setenv("XDG_CACHE_HOME", "")
+	v := newDiffView(Repo{Slug: "o/r"}, 1, "t")
+	v.drafts = nil
+	v.files = []File{{Path: "a.go", Patch: "@@ -1,3 +1,3 @@\n one\n-two\n+2\n three"}}
+	key := func(k string) tea.Cmd {
+		_, cmd := v.key(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)})
+		return cmd
+	}
+	key("j") // one
+	key("m")
+	key("j")
+	key("j")
+	key("j") // three
+	cmd := key("C")
+	if cmd == nil {
+		t.Fatalf("C should open the composer: %s", v.note)
+	}
+	c, ok := cmd().(pushViewMsg).v.(*composer)
+	if !ok {
+		t.Fatal("C should open a composer")
+	}
+	if got := c.ta.Value(); got != "```suggestion\none\n2\nthree\n```" {
+		t.Errorf("the suggestion should start as the new lines: %q", got)
+	}
+	c.done("```suggestion\nall\n```")
+	if len(v.drafts) != 1 {
+		t.Fatal("a draft should be added")
+	}
+	d := v.drafts[0]
+	if d.StartLine != 1 || d.Line != 3 || d.StartSide != "RIGHT" || d.Side != "RIGHT" || v.mark != -1 {
+		t.Errorf("draft = %+v, mark %d", d, v.mark)
+	}
+	b, _ := json.Marshal(d)
+	if !strings.Contains(string(b), `"start_line":1`) {
+		t.Errorf("the review payload should carry start_line: %s", b)
+	}
+}
+
+func TestSavedSearches(t *testing.T) {
+	cfg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfg)
+	os.MkdirAll(cfg+"/ghdeck", 0o700)
+	os.WriteFile(cfg+"/ghdeck/config.json", []byte(`{
+		"pull_requests": [{"name": "my team", "query": "is:open team-review-requested:acme/web"}],
+		"repos": {"Acme/Web": {"issues": [{"name": "needs QA", "query": "is:open label:qa"}]},
+		          "other/repo": {"issues": [{"name": "not here", "query": "x"}]}}
+	}`), 0o600)
+	root := t.TempDir()
+	os.WriteFile(root+"/.ghdeck.json", []byte(`{"pull_requests": [{"name": "release", "query": "is:open base:release"}]}`), 0o644)
+	prs, issues, err := loadFilters(Repo{Slug: "acme/web", Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := func(fs []filter) (out []string) {
+		for _, f := range fs {
+			out = append(out, f.name)
+		}
+		return
+	}
+	if got := strings.Join(names(prs[len(prFilters):]), ","); got != "my team,release" {
+		t.Errorf("pull request searches = %q", got)
+	}
+	if got := strings.Join(names(issues[len(issueFilters):]), ","); got != "needs QA" {
+		t.Errorf("issue searches = %q", got)
+	}
+	os.WriteFile(cfg+"/ghdeck/config.json", []byte(`{not json`), 0o600)
+	if prs, _, err := loadFilters(Repo{Slug: "acme/web"}); err == nil || len(prs) != len(prFilters) {
+		t.Error("a broken config should be reported, with the presets still there")
+	}
+}
+
+// A click on a row chooses it, a second click opens it, a click on a tab switches to it, and the wheel scrolls.
+func TestMouse(t *testing.T) {
+	t.Setenv("HERDR_ENV", "")
+	m := newModel(Repo{Slug: "o/r"})
+	m.w, m.h = 120, 30
+	m.panels[kPRs] = &panel{val: List{Total: 3, Items: []Item{{Number: 1, IsPR: true}, {Number: 2, IsPR: true}, {Number: 3, IsPR: true}}}}
+	y := len(m.headLines()) + 2 // the third row
+	click := func(m model, x, y int) (model, tea.Cmd) {
+		next, cmd := m.Update(tea.MouseMsg{X: x, Y: y, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+		return next.(model), cmd
+	}
+	m, _ = click(m, 10, y)
+	if m.sel[tabPRs] != 2 {
+		t.Fatalf("a click should choose the row under it: chose %d", m.sel[tabPRs])
+	}
+	if _, cmd := click(m, 10, y); cmd == nil {
+		t.Error("a click on the chosen row should open it")
+	} else if _, ok := cmd().(pushViewMsg); !ok {
+		t.Error("opening should push the pull request's screen")
+	}
+	issuesX := lipgloss.Width(m.tabPieces()[0]) + lipgloss.Width(m.tabPieces()[1]) + 1
+	if m2, _ := click(m, issuesX, 0); m2.tab != tabIssues {
+		t.Errorf("a click on the Issues tab should switch to it: tab %d", m2.tab)
+	}
+	next, _ := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp})
+	if next.(model).sel[tabPRs] != 0 {
+		t.Errorf("the wheel should move the choice up: %d", next.(model).sel[tabPRs])
+	}
+}
+
+// The diff keeps its rows between keys, but never past a change to what they show.
+func TestDiffRowsCacheInvalidates(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", "")
+	v := newDiffView(Repo{Slug: "o/r"}, 1, "t")
+	v.drafts = nil
+	v.files = []File{{Path: "a.go", Patch: "@@ -1,1 +1,1 @@\n+x := 1"}}
+	if strings.Contains(v.View(100, 20), "your draft") {
+		t.Fatal("no draft yet")
+	}
+	v.drafts = append(v.drafts, DraftComment{Path: "a.go", Line: 1, Side: "RIGHT", Body: "hm"})
+	v.saveDrafts("drafted")
+	if !strings.Contains(v.View(100, 20), "your draft") {
+		t.Error("a new draft should show at the next draw")
+	}
+}
+
+// A mark from a longer diff must not reach into a shorter one.
+func TestMarkDoesNotOutliveTheDiff(t *testing.T) {
+	v := newDiffView(Repo{Slug: "o/r"}, 1, "t")
+	v.drafts = nil
+	long := "@@ -1,9 +1,9 @@\n"
+	for i := 0; i < 9; i++ {
+		long += " line\n"
+	}
+	v.files = []File{{Path: "a.go", Patch: long}}
+	v.cursor = 8
+	v.key(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	v.Update(sinceMsg{id: v.id, files: []File{{Path: "a.go", Patch: "@@ -1,1 +1,1 @@\n x"}}})
+	v.cursor = 1
+	v.key(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}}) // panicked before
+	if v.mark != -1 {
+		t.Errorf("the mark should be gone: %d", v.mark)
+	}
+}
+
+// A repository's .ghdeck.json is anyone's: its names are cleaned, and it must be a small plain file.
+func TestRepoConfigIsUntrusted(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	root := t.TempDir()
+	os.WriteFile(root+"/.ghdeck.json", []byte(`{"pull_requests":[{"name":"\u001b]52;c;cHduZWQ=\u0007mine","query":"is:open"}]}`), 0o644)
+	prs, _, err := loadFilters(Repo{Slug: "o/r", Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last := prs[len(prs)-1].name; strings.ContainsAny(last, "\x1b\x07") || last != "mine" {
+		t.Errorf("name = %q", last)
+	}
+	os.Remove(root + "/.ghdeck.json")
+	os.Symlink("/dev/zero", root+"/.ghdeck.json")
+	if _, _, err := loadFilters(Repo{Slug: "o/r", Root: root}); err == nil {
+		t.Error("a symlink should be refused, not read")
+	}
+}
+
+// Editing starts from the text as written: tabs and all, without what could act on the terminal.
+func TestForEditing(t *testing.T) {
+	in := "build:\n\tgo build\n\x1b]52;c;eA==\x07done ‮rtl"
+	if got := forEditing(in); got != "build:\n\tgo build\ndone ‮rtl" {
+		t.Errorf("forEditing = %q", got)
+	}
 }

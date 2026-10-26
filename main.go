@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -40,6 +41,15 @@ func main() {
 	var target *target
 	if *openFlag != "" {
 		t, ok := parseTarget(*openFlag)
+		if !ok && strings.HasPrefix(*openFlag, "https://") {
+			// A link on another host, which the Herdr link handler passes on too: it opens in the browser, as
+			// a click would have without ghdeck.
+			if msg, _ := openURL(*openFlag)().(actionMsg); msg.err != nil {
+				fmt.Fprintln(os.Stderr, "ghdeck:", errText(msg.err))
+				os.Exit(1)
+			}
+			return
+		}
 		if !ok {
 			fmt.Fprintln(os.Stderr, "ghdeck: -open takes a number, owner/name#123, or a github.com link to a pull request, issue or run")
 			os.Exit(2)
@@ -58,7 +68,7 @@ func main() {
 	m := newModel(r)
 	m.openBranch = *branchFlag
 	m.openTarget = target
-	if _, err := tea.NewProgram(m, tea.WithAltScreen()).Run(); err != nil {
+	if _, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion()).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "ghdeck:", err)
 		os.Exit(1)
 	}

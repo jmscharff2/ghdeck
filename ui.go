@@ -54,6 +54,13 @@ type actionMsg struct {
 
 type tickMsg struct{ gen int }
 
+// filterMsg chooses a list's filter, from the F picker.
+type filterMsg struct{ tab, filter int }
+
+// flashGoneMsg clears a flash that has been on screen long enough, so the footer changes by a message, not by the
+// clock: what a click measures is then what was drawn.
+type flashGoneMsg struct{ at time.Time }
+
 // agentsMsg brings which agent is on which branch, from Herdr and local git.
 type agentsMsg map[string]agent
 
@@ -71,10 +78,11 @@ type model struct {
 	panels   map[string]*panel
 	tab      int
 	sel      [4]int
-	filter   [2]int    // the preset search for pull requests and issues
-	search   [2]string // a search typed with /, replacing the preset
-	runsMine bool      // Actions shows only the current branch's runs
-	inboxAll bool      // the inbox shows read notifications too
+	filter   [2]int      // the preset search for pull requests and issues
+	filters  [2][]filter // the presets, then your saved searches
+	search   [2]string   // a search typed with /, replacing the preset
+	runsMine bool        // Actions shows only the current branch's runs
+	inboxAll bool        // the inbox shows read notifications too
 
 	typing bool
 	draft  string
@@ -83,6 +91,7 @@ type model struct {
 	flash   string
 	isErr   bool
 	flashAt time.Time
+	flashBy time.Time // the flash a timer is set to clear
 	confirm *confirmation
 	help    bool
 	stack   []subview
@@ -103,7 +112,13 @@ type model struct {
 }
 
 func newModel(r Repo) model {
-	return model{repo: r, branch: currentBranch(r.Root), panels: map[string]*panel{}}
+	m := model{repo: r, branch: currentBranch(r.Root), panels: map[string]*panel{}}
+	var err error
+	m.filters[tabPRs], m.filters[tabIssues], err = loadFilters(r)
+	if err != nil {
+		m.say(errText(err), true)
+	}
+	return m
 }
 
 // agentsOn is the latest agentsMsg, for views that show the agent on a branch. Only the UI goroutine touches it.
@@ -215,11 +230,7 @@ func (m model) listQuery(tab int) string {
 		}
 		return ""
 	}
-	fs := prFilters
-	if tab == tabIssues {
-		fs = issueFilters
-	}
-	return searchQuery(m.repo.Slug, tab == tabPRs, fs[m.filter[tab]], m.search[tab])
+	return searchQuery(m.repo.Slug, tab == tabPRs, m.filters[tab][m.filter[tab]], m.search[tab])
 }
 
 func (m model) refreshTab(tab int) tea.Cmd {
@@ -339,16 +350,26 @@ func (m *model) say(text string, isErr bool) { m.flash, m.isErr, m.flashAt = tex
 
 // Update notes each time someone uses ghdeck, and wakes it after a quiet spell.
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var wake tea.Cmd
 	switch msg.(type) {
 	case tea.KeyMsg, tea.MouseMsg:
-		woke := idle()
-		lastActive = time.Now()
-		if woke {
-			next, cmd := m.update(msg)
-			return next, tea.Batch(cmd, func() tea.Msg { return wakeMsg{} })
+		if idle() {
+			wake = func() tea.Msg { return wakeMsg{} }
 		}
+		lastActive = time.Now()
 	}
-	return m.update(msg)
+	next, cmd := m.update(msg)
+	nm, ok := next.(model)
+	if !ok {
+		return next, tea.Batch(cmd, wake)
+	}
+	var gone tea.Cmd
+	if nm.flash != "" && !nm.flashAt.Equal(nm.flashBy) {
+		at := nm.flashAt
+		nm.flashBy = at
+		gone = tea.Tick(8*time.Second, func(time.Time) tea.Msg { return flashGoneMsg{at} })
+	}
+	return nm, tea.Batch(cmd, wake, gone)
 }
 
 func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -458,6 +479,16 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case execMsg:
 		return m, execHere(msg)
+	case tea.MouseMsg:
+		return m.mouse(msg)
+	case flashGoneMsg:
+		if msg.at.Equal(m.flashAt) {
+			m.flash = ""
+		}
+		return m, nil
+	case filterMsg:
+		m.filter[msg.tab], m.search[msg.tab], m.sel[msg.tab] = msg.filter, "", 0
+		return m, m.refreshTab(msg.tab)
 	case agentsMsg:
 		m.agents = msg
 		agentsOn = msg // for the pull request screen
@@ -624,13 +655,29 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.sel[m.tab] = 0
 			return m, m.refreshTab(m.tab)
 		}
-		n := len(prFilters)
-		if m.tab == tabIssues {
-			n = len(issueFilters)
-		}
-		m.filter[m.tab] = (m.filter[m.tab] + 1) % n
+		m.filter[m.tab] = (m.filter[m.tab] + 1) % len(m.filters[m.tab])
 		m.search[m.tab], m.sel[m.tab] = "", 0
 		return m, m.refreshTab(m.tab)
+	case "F":
+		if m.tab == tabPRs || m.tab == tabIssues {
+			tab, presets := m.tab, len(prFilters)
+			if tab == tabIssues {
+				presets = len(issueFilters)
+			}
+			var opts []option
+			for i, f := range m.filters[tab] {
+				i := i
+				detail := f.query
+				if i >= presets {
+					detail += sMuted.Render(" · saved")
+				}
+				opts = append(opts, option{label: f.name, match: f.name, detail: detail,
+					run: func() tea.Cmd { return func() tea.Msg { return filterMsg{tab, i} } }})
+			}
+			p := newPicker("Filter "+strings.ToLower(tabNames[tab]), opts)
+			p.sel, p.filterable = m.filter[tab], true
+			return m, pushView(p)
+		}
 	case "/":
 		if m.tab == tabPRs || m.tab == tabIssues {
 			m.typing, m.draft = true, m.search[m.tab]
@@ -873,8 +920,89 @@ func (m model) View() string {
 		}
 		return m.stack[n-1].View(m.w, m.h-1) + "\n" + toast
 	}
-	var head []string
-	tabs := []string{sTitle.Render("ghdeck") + " "}
+	head := m.headLines()
+	foot := m.footer()
+	bodyH := max(1, m.h-len(head)-lipgloss.Height(foot))
+	var body []string
+	switch m.tab {
+	case tabRuns:
+		body = m.runRows(bodyH)
+	case tabInbox:
+		body = m.inboxRows(bodyH)
+	default:
+		body = m.itemRows(bodyH)
+	}
+	for len(body) < bodyH {
+		body = append(body, "")
+	}
+	return strings.Join(head, "\n") + "\n" + strings.Join(body, "\n") + "\n" + foot
+}
+
+// mouse: the wheel scrolls whatever is on screen; on the lists, a click on a tab switches to it, a click on a row
+// chooses it, and a click on the chosen row opens it.
+func (m model) mouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if m.confirm != nil || m.typing {
+		return m, nil
+	}
+	if msg.Action == tea.MouseActionPress && (msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown) {
+		k := tea.KeyMsg{Type: tea.KeyDown}
+		if msg.Button == tea.MouseButtonWheelUp {
+			k = tea.KeyMsg{Type: tea.KeyUp}
+		}
+		var cmds []tea.Cmd
+		var next tea.Model = m
+		for i := 0; i < 3; i++ {
+			var cmd tea.Cmd
+			next, cmd = next.(model).update(k)
+			cmds = append(cmds, cmd)
+		}
+		return next, tea.Batch(cmds...)
+	}
+	if len(m.stack) > 0 || msg.Action != tea.MouseActionPress || msg.Button != tea.MouseButtonLeft {
+		return m, nil
+	}
+	if msg.Y == 0 {
+		x := 0
+		for i, piece := range m.tabPieces() {
+			w := lipgloss.Width(piece)
+			if i > 0 && msg.X >= x && msg.X < x+w {
+				return m.switchTab(i - 1)
+			}
+			x += w
+		}
+		return m, nil
+	}
+	row, ok := m.rowAt(msg.Y)
+	if !ok {
+		return m, nil
+	}
+	if row == m.sel[m.tab] {
+		return m.updateKey(tea.KeyMsg{Type: tea.KeyEnter})
+	}
+	m.sel[m.tab] = row
+	return m, nil
+}
+
+// rowAt is the list row drawn at screen line y, as View lays the list out.
+func (m model) rowAt(y int) (int, bool) {
+	head := m.headLines()
+	body := y - len(head)
+	bodyH := max(1, m.h-len(head)-lipgloss.Height(m.footer()))
+	key := map[int]string{tabPRs: kPRs, tabIssues: kIssues, tabRuns: kRuns, tabInbox: kInbox}[m.tab]
+	if p := m.panels[key]; p != nil && p.err != nil { // the error line above the rows
+		body, bodyH = body-1, bodyH-1
+	}
+	n := m.rows()
+	if body < 0 || body >= bodyH {
+		return 0, false
+	}
+	row := scrollStart(m.sel[m.tab], n, bodyH) + body
+	return row, row < n
+}
+
+// tabPieces is the first line, a piece at a time: the name, then each tab's label. Clicks are matched against them.
+func (m model) tabPieces() []string {
+	pieces := []string{sTitle.Render("ghdeck") + " "}
 	for i, name := range tabNames {
 		style := sTabOff
 		if i == m.tab {
@@ -900,9 +1028,15 @@ func (m model) View() string {
 				}
 			}
 		}
-		tabs = append(tabs, style.Render(label))
+		pieces = append(pieces, style.Render(label))
 	}
-	head = append(head, truncStyledLine(lipgloss.JoinHorizontal(lipgloss.Top, tabs...), m.w))
+	return pieces
+}
+
+// headLines is everything above the list.
+func (m model) headLines() []string {
+	var head []string
+	head = append(head, truncStyledLine(lipgloss.JoinHorizontal(lipgloss.Top, m.tabPieces()...), m.w))
 	head = append(head, truncStyledLine(m.statusLine(), m.w))
 	if m.authExpired() {
 		head = append(head, sBad.Render(" ⚠ gh login expired. Press A to sign in, then r."))
@@ -910,23 +1044,7 @@ func (m model) View() string {
 	if note := ghBudget(); note != "" {
 		head = append(head, sWarn.Render(" ⚠ "+note))
 	}
-	head = append(head, m.filterLine())
-
-	foot := m.footer()
-	bodyH := max(1, m.h-len(head)-lipgloss.Height(foot))
-	var body []string
-	switch m.tab {
-	case tabRuns:
-		body = m.runRows(bodyH)
-	case tabInbox:
-		body = m.inboxRows(bodyH)
-	default:
-		body = m.itemRows(bodyH)
-	}
-	for len(body) < bodyH {
-		body = append(body, "")
-	}
-	return strings.Join(head, "\n") + "\n" + strings.Join(body, "\n") + "\n" + foot
+	return append(head, m.filterLine())
 }
 
 // toast is the last action's result, shown for a few seconds over whatever view is on top.
@@ -988,11 +1106,7 @@ func (m model) filterLine() string {
 		}
 		p = m.panels[kRuns]
 	default:
-		fs := prFilters
-		if m.tab == tabIssues {
-			fs = issueFilters
-		}
-		what = fs[m.filter[m.tab]].name
+		what = m.filters[m.tab][m.filter[m.tab]].name
 		if s := m.search[m.tab]; s != "" {
 			what = "search: " + s
 		}
@@ -1232,7 +1346,7 @@ func (m model) footer() string {
 		return c.view()
 	}
 	var b strings.Builder
-	if m.flash != "" && time.Since(m.flashAt) < 8*time.Second {
+	if m.flash != "" {
 		style := sGood
 		if m.isErr {
 			style = sBad
@@ -1242,9 +1356,9 @@ func (m model) footer() string {
 	keys := [][2]string{{"tab", "list"}, {"↑↓ enter", "open"}}
 	switch m.tab {
 	case tabPRs:
-		keys = append(keys, [2]string{"d", "diff"}, [2]string{"f", "filter"}, [2]string{"/", "search"})
+		keys = append(keys, [2]string{"d", "diff"}, [2]string{"f F", "filter"}, [2]string{"/", "search"})
 	case tabIssues:
-		keys = append(keys, [2]string{"f", "filter"}, [2]string{"/", "search"})
+		keys = append(keys, [2]string{"f F", "filter"}, [2]string{"/", "search"})
 	case tabRuns:
 		keys = append(keys, [2]string{"f", "this branch"})
 	case tabInbox:
