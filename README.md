@@ -1,15 +1,17 @@
 # ghdeck
 
 A terminal deck for the GitHub repository you are working in. It shows the repo's pull requests, issues and Actions
-runs, and opens with your branch's pull request one key away. You can review a diff line by line, draft comments
-and send them as one review, approve, merge, read a failed job's log, and check a pull request out into a worktree,
-all without leaving the terminal. Inside [Herdr](https://herdr.dev), any of it can be handed to a coding agent
-running in another pane.
+runs, your inbox from every repository, and your branch's pull request one key away. You can review a diff line by
+line, highlighted and side by side, draft comments and suggestions and send them as one review, resolve threads, open
+a pull request from any branch into any other, approve, merge, read a failed job's log, and check a pull request out
+into a worktree, all without leaving the terminal. Inside [Herdr](https://herdr.dev), a pull request goes to a coding
+agent in its own worktree in one key, the sidebar shows each workspace's pull request, and GitHub links you click open
+in ghdeck.
 
 ghdeck uses the `gh` CLI's login. It stores no credentials and calls nothing but the GitHub API.
 
 ```
-ghdeck  1 Pull requests 12  2 Issues 31  3 Actions
+ghdeck  1 Pull requests 12  2 Issues 31  3 Actions  4 Inbox 5
  me/my-app · on fix-login → #482 ✓ approved · b · 2 awaiting your review
  open · 12s ago
 ▸ #482  ● Fix the login redirect loop             ✓✔ +48−12      💬3   me             2h
@@ -118,10 +120,10 @@ is in, and marks it read; `d` opens a pull request's diff; `x` marks it done.
 **A pull request.** Its merge state, a summary of its checks and reviewers, the description, the checks (failing
 ones first), unresolved review threads, and the conversation: comments, reviews, commits, merges.
 
-**The diff.** One file at a time, its code highlighted for the language and added and removed lines tinted, with each review thread under the line it is on and outdated threads at the top
-of their file. `c` drafts a comment on the line under the cursor. Drafts are saved as you write them (in
-`~/Library/Caches/ghdeck` on macOS, `~/.cache/ghdeck` on Linux), so closing the pane loses nothing. `v` sends every
-draft as one review, with a verdict and a summary.
+**The diff.** One file at a time, its code highlighted for the language and added and removed lines tinted, with each
+review thread under the line it is on and outdated threads at the top of their file. `c` drafts a comment on the line
+under the cursor. Drafts are saved as you write them (in `~/Library/Caches/ghdeck` on macOS, `~/.cache/ghdeck` on
+Linux), so closing the pane loses nothing. `v` sends every draft as one review, with a verdict and a summary.
 
 **A new pull request** (`n`). Choose the branch to merge, your checked-out branch first or any branch on GitHub,
 then the branch it goes into. ghdeck has no settings for how your team works; it reads that from where the
@@ -217,14 +219,14 @@ REST API, asked for again with the last response's ETag. GitHub answers 304 when
 count against the hourly limit. GraphQL has no such shortcut, so every refresh there is paid for: about 2 points for
 a list, 1 for the header or a pull request's screen, out of 5,000 an hour that `gh` and your agents share.
 
-Lists refresh every 30 seconds (every 10 while an Actions run on screen is moving), the header once a minute, and a
-pull request's screen every minute, or every 15 seconds while its checks run. That is about 300 points an hour while
-you use it. After 10 minutes with no key pressed, everything slows to once every 2 minutes, and after an hour to once
-every 10, so a deck left open in a pane costs about 20 points an hour. Decks open at the same time share what they
-fetch: an answer one got in the last 20 seconds serves the others, so two panes on a repository cost about what one
-does. (The answers are kept in your cache directory, readable only by you, and any change you make clears them.) The next key refreshes at once. When either
-hourly budget falls below 1,000, everything slows to once every 2 minutes. When a limit is reached, ghdeck stops asking
-until the reset time it shows. `GH_HOST` points it at GitHub Enterprise.
+Lists refresh every 30 seconds (every 10 while an Actions run on screen is moving), the header once a minute, and a pull
+request's screen every minute, or every 15 seconds while its checks run. That is about 300 points an hour while you use
+it. After 10 minutes with no key pressed, everything slows to once every 2 minutes, and after an hour to once every 10,
+so a deck left open in a pane costs about 20 points an hour. Decks open at the same time share what they fetch: an
+answer one got in the last 20 seconds serves the others, so two panes on a repository cost about what one does. (The
+answers are kept in your cache directory, readable only by you, and any change you make clears them.) The next key
+refreshes at once. When either hourly budget falls below 1,000, everything slows to once every 2 minutes. When a limit
+is reached, ghdeck stops asking until the reset time it shows. `GH_HOST` points it at GitHub Enterprise.
 
 ## Security
 
