@@ -27,6 +27,9 @@ Needs Go 1.24+ and the [GitHub CLI](https://cli.github.com), signed in (`gh auth
 go install github.com/jmscharff2/ghdeck@latest
 ```
 
+Without Go, download a binary for macOS or Linux from the [releases](https://github.com/jmscharff2/ghdeck/releases)
+and put it on your `PATH`.
+
 Run it anywhere inside a checkout. It finds the repository from the remote that `gh repo set-default` chose, else
 `origin`, else the first GitHub remote. `ghdeck -R owner/name` opens any repository, and `ghdeck -branch` opens
 straight onto the pull request for the checked-out branch.
@@ -202,3 +205,5 @@ go test ./...
 GHDECK_LIVE=1 go test -run TestLive .    # reads a public repo through the real API
 go build -o ghdeck . && ./ghdeck -R owner/name
 ```
+
+CI runs the same checks on every pull request. Pushing a tag such as `v0.2.0` publishes a release with binaries.
